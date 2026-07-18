@@ -33,12 +33,16 @@ VLX-Seek 是一个面向端侧具身视觉的细粒度感知视觉语言模型�
 
 不同于让语言模型直接生成边界框坐标，VLX-Seek 将定位任务改写为区域检索与区域引用问题。候选区域会被编码成可寻址的区域 token，语言模型通过选择、比较和引用这些区域来完成 grounded 输出。
 
+## 更新
+
+- **[2026-07-06]** [VLX-Seek 1.5](https://om-ai-lab.github.io/2026_07_06_vlx_seek_1_5_en.html) 正式发布，面向具身场景带来更强的细粒度感知、更快的推理速度，以及更可靠的缺失目标拒识能力。10B 模型即将开源。
+
+
+
+## 项目概览
 <p align="center">
   <img src="assets/vlx_seek_model_flow_realistic_visual_sources.png" alt="VLX-Seek 总览图：视觉来源、候选区域、区域 token 与 grounded output" width="88%">
 </p>
-
-## 项目概览
-
 现代 VLM 在全局场景理解上已经很强，可以描述图像、回答视觉问题、理解复杂指令，并进行多模态推理。但细粒度感知需要另一类能力：
 
 - **精确定位：** 判断目标在哪里，以及边界应如何与相邻物体区分。

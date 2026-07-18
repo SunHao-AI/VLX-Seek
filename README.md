@@ -33,12 +33,16 @@ VLX-Seek is a fine-grained perception vision-language model for edge-side embodi
 
 Instead of asking the language model to directly generate bounding-box coordinates, VLX-Seek reformulates localization as region retrieval and region reference. Candidate regions are encoded as addressable region tokens, and the language model answers by selecting, comparing, and referring to those regions.
 
+## Updates
+
+- **[2026-07-06]** [VLX-Seek 1.5](https://om-ai-lab.github.io/2026_07_06_vlx_seek_1_5_en.html) is released, bringing stronger fine-grained perception, faster inference, and improved rejection of absent targets for embodied scenarios. The 10B model will be open-sourced soon.
+
+
+
+## Overview
 <p align="center">
   <img src="assets/vlx_seek_model_flow_realistic_visual_sources.png" alt="VLX-Seek overview: visual sources, region proposals, region tokens, and grounded output" width="88%">
 </p>
-
-## Overview
-
 Modern VLMs are strong at global scene understanding. They can describe images, answer visual questions, follow complex instructions, and perform multimodal reasoning. However, fine-grained perception requires a different level of visual grounding:
 
 - **Precise localization:** where the target is and how its boundary should be separated from nearby objects.
