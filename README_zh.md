@@ -38,7 +38,7 @@ VLX-Seek 是一个面向端侧具身视觉的细粒度感知视觉语言模型�
 
 ## 更新
 
-- **[2026-07-23]** **VLX-Seek 1.5-10B** 推理代码与模型权重现已开源，权重下载地址：[omlab/VLX-Seek-1.5-10B](https://huggingface.co/omlab/VLX-Seek-1.5-10B)。
+- **[2026-07-23]** 🔥🔥🔥 **VLX-Seek 1.5-10B** 推理代码与模型权重现已开源，权重下载地址：[omlab/VLX-Seek-1.5-10B](https://huggingface.co/omlab/VLX-Seek-1.5-10B)。
 - **[2026-07-06]** [VLX-Seek 1.5](https://om-ai-lab.github.io/2026_07_06_vlx_seek_1_5_zh.html) 正式发布，面向具身场景带来更强的细粒度感知、更快的推理速度，以及更可靠的缺失目标拒识能力。
 
 

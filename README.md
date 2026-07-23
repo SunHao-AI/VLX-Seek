@@ -38,7 +38,7 @@ Instead of asking the language model to directly generate bounding-box coordinat
 
 ## Updates
 
-- **[2026-07-23]** The inference code and model weights for **VLX-Seek 1.5-10B** are now open source. Checkpoint: [omlab/VLX-Seek-1.5-10B](https://huggingface.co/omlab/VLX-Seek-1.5-10B).
+- **[2026-07-23]** 🔥🔥🔥 The inference code and model weights for **VLX-Seek 1.5-10B** are now open source. Checkpoint: [omlab/VLX-Seek-1.5-10B](https://huggingface.co/omlab/VLX-Seek-1.5-10B).
 - **[2026-07-06]** [VLX-Seek 1.5](https://om-ai-lab.github.io/2026_07_06_vlx_seek_1_5_en.html) is released, bringing stronger fine-grained perception, faster inference, and improved rejection of absent targets for embodied scenarios.
 
 
