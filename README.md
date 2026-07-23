@@ -14,11 +14,14 @@
   <a href="https://x.com/OmAI_lab">
     <img alt="X" src="https://img.shields.io/badge/%F0%9F%93%A3%20X-Follow%20%40OmAI_lab-000000">
   </a>
-  <a href="https://om-ai-lab.github.io/2026_06_27_vlx_seek_en.html">
-    <img alt="Blog" src="https://img.shields.io/badge/%F0%9F%93%9D%20Blog-Read%20Article-2563eb">
+  <a href="https://om-ai-lab.github.io/2026_07_06_vlx_seek_1_5_en.html">
+    <img alt="VLX-Seek 1.5 blog" src="https://img.shields.io/badge/%F0%9F%93%9D%20VLX--Seek%201.5-Read%20Blog-2563eb">
   </a>
   <!-- <a href="https://platform.om-agent.cn/subapp-index/#/front"> -->
     <img alt="Demo coming soon" src="https://img.shields.io/badge/%F0%9F%9A%80%20Demo-Coming%20Soon-94a3b8">
+  </a>
+  <a href="https://huggingface.co/omlab/VLX-Seek-1.5-10B">
+    <img alt="Hugging Face model" src="https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Model-f9d54a">
   </a>
   <a href="https://huggingface.co/blog/omlab/vlx-seek">
     <img alt="Hugging Face blog" src="https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Read%20Blog-f9d54a">
@@ -35,7 +38,8 @@ Instead of asking the language model to directly generate bounding-box coordinat
 
 ## Updates
 
-- **[2026-07-06]** [VLX-Seek 1.5](https://om-ai-lab.github.io/2026_07_06_vlx_seek_1_5_en.html) is released, bringing stronger fine-grained perception, faster inference, and improved rejection of absent targets for embodied scenarios. The 10B model will be open-sourced soon.
+- **[2026-07-23]** The inference code and model weights for **VLX-Seek 1.5-10B** are now open source. Checkpoint: [omlab/VLX-Seek-1.5-10B](https://huggingface.co/omlab/VLX-Seek-1.5-10B).
+- **[2026-07-06]** [VLX-Seek 1.5](https://om-ai-lab.github.io/2026_07_06_vlx_seek_1_5_en.html) is released, bringing stronger fine-grained perception, faster inference, and improved rejection of absent targets for embodied scenarios.
 
 
 
@@ -68,7 +72,110 @@ This makes localization closer to what LLMs already do well: compare, select, re
 
 ## Open-Source Models
 
-Model weights will be released soon.
+VLX-Seek 1.5 is planned as a family of 0.6B, 3B, and 10B models. This repository releases the inference code and model weights for the **10B** model.
+
+| Model | Checkpoint | Status |
+| --- | --- | --- |
+| VLX-Seek 1.5-10B | [omlab/VLX-Seek-1.5-10B](https://huggingface.co/omlab/VLX-Seek-1.5-10B) | Released |
+
+
+
+### What's New in VLX-Seek 1.5
+
+- **Stronger embodied perception:** expanded drone-view, surveillance-view, robot-view, and other embodied-scene training data.
+- **Upgraded visual stack:** a stronger auxiliary vision tower and VLM backbone improve fine-grained region understanding and complex target detection.
+- **Faster inference:** a faster proposal pipeline and more Linear Attention layers reduce inference and memory cost.
+- **Fewer hallucinated detections:** hard-negative rejection training and an explicit `None` format help the model reject requested targets that are absent.
+
+See the [VLX-Seek 1.5 blog](https://om-ai-lab.github.io/2026_07_06_vlx_seek_1_5_en.html) for architecture details, benchmark results, and qualitative examples.
+
+## Requirements
+
+- Python 3.10+
+- PyTorch (GPU recommended). Please install the CUDA-enabled build that matches your system.
+- Linux is the primary tested platform.
+
+## Installation
+
+```bash
+git clone https://github.com/om-ai-lab/VLX-Seek.git
+cd VLX-Seek
+pip install -r requirements.txt
+```
+
+
+## Model Weights
+
+The VLX-Seek 1.5-10B checkpoint is hosted on Hugging Face: [omlab/VLX-Seek-1.5-10B](https://huggingface.co/omlab/VLX-Seek-1.5-10B).
+
+### Load from Hugging Face
+
+The VLX-Seek main model can be loaded directly without a manual download:
+
+```bash
+python inference.py \
+  --model-path omlab/VLX-Seek-1.5-10B \
+  --image-path demo/demo_image.jpg \
+  --task detection \
+  --text "orange; apple"
+```
+
+The first run will download and cache the VLX-Seek weights from Hugging Face. Make sure you have cloned this repository and installed the dependencies first, since the model architecture is provided by the local `vlx_seek` package.
+
+For detection, grounding, and other proposal-dependent tasks, if `--bbox-list` is not provided, the recommend region detector checkpoint is automatically downloaded from Hugging Face to the default path `resources/` when needed. You can also override the path with `--detector-checkpoint`, or pass `--bbox-list` to skip the detector entirely.
+
+In Python, you can also load the model with:
+
+```python
+from vlx_seek_worker import VLXSeekWorker
+
+worker = VLXSeekWorker("omlab/VLX-Seek-1.5-10B", device="cuda")
+```
+
+### Download Locally
+
+Alternatively, download the checkpoint and the region detector checkpoint into the following layout:
+
+```text
+resources/
+├── VLX-Seek-1.5-10B/
+└── wedetect_base_uni.pth
+```
+
+Download links:
+
+- VLX-Seek 1.5-10B: [omlab/VLX-Seek-1.5-10B](https://huggingface.co/omlab/VLX-Seek-1.5-10B)
+- Region detector checkpoint: [WeDetect](https://huggingface.co/fushh7/WeDetect)
+
+Both paths can be overridden with `--model-path` and `--detector-checkpoint`.
+
+### Region Proposal Model
+
+> **Note:** Due to company policy, we are unable to release the internally trained OPN referenced in our blog. Instead, this repository integrates the open-source, lightweight **WeDetect-Base-Uni** detector as an alternative for generating proposal bounding boxes.
+
+You may also use any object detector of your choice. Convert its proposals to pixel-coordinate boxes in `[x1, y1, x2, y2]` format and pass them with `--bbox-list`. The built-in region detector is only loaded when `--bbox-list` is omitted.
+
+## Quick Start
+
+Run open-vocabulary detection with automatically generated proposals:
+
+```bash
+python inference.py \
+  --image-path demo/demo_image.jpg \
+  --task detection \
+  --text "orange; apple"
+```
+
+Run general visual question answering without region proposals:
+
+```bash
+python inference.py \
+  --image-path demo/demo_image.jpg \
+  --task vqa \
+  --text "What fruits are in the image?"
+```
+
+Detection results are printed as JSON and visualized to `<image_stem>_result.png` by default. See the **[complete inference guide](docs/inference.md)** for all tasks, custom proposals, generation options, output fields, and the Python API.
 
 ## Problem Setting
 
@@ -99,7 +206,7 @@ When a user asks "Find the people wearing red", the model does not need to write
 For example:
 
 ```text
-<ground>people wearing red</ground><object><obj2><obj5></object>.
+<ground>people wearing red</ground><objects><obj2><obj5></objects>.
 ```
 
 Here, `<obj2><obj5>` is the model's concrete special-token output for the selected candidate regions. After generation, the system can use these region indices to quickly look up the corresponding input proposals and map them back to actual bbox coordinates. This output is compact, easier to parse, and better aligned with language-model behavior than long coordinate sequences. It is also faster to decode: for multiple targets, VLX-Seek only needs to emit short region IDs instead of full `[x1, y1, x2, y2]` coordinate tuples for every object. The same mechanism can support open-vocabulary detection, referring expression comprehension, region captioning, region VQA, OCR, counting, and visual reasoning.
@@ -145,10 +252,10 @@ VLX-Seek supports a broad set of region-centric perception tasks:
 - **Open-vocabulary detection:** find targets described by flexible text labels.
 - **Referring expression comprehension:** identify the instance that matches a complex description.
 - **Region OCR:** read text from selected visual regions.
-- **Region VQA:** answer questions about a specified region.
 - **Region captioning:** describe selected areas in detail.
 - **Object counting:** count instances by detecting and aggregating regions.
 - **Visual region reasoning:** use explicit regions as evidence for multi-step answers.
+- **General VQA:** answer free-form questions about the full image without requiring proposals.
 
 ## Training Strategy
 
@@ -173,7 +280,7 @@ The goal is not only to teach the model how to find objects, but also when not t
 
 ## Results Comparison
 
-The 3B version of VLX-Seek shows strong performance across fine-grained perception tasks, outperforming many larger open-source and closed-source models.
+The following figures report results for the original VLX-Seek 3B model. For VLX-Seek 1.5-3B and 1.5-10B results across general recognition, drone scenarios, embodied spatial reasoning, and object hallucination, see the [VLX-Seek 1.5 blog](https://om-ai-lab.github.io/2026_07_06_vlx_seek_1_5_en.html).
 
 <table align="center">
   <tr>
