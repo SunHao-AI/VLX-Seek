@@ -1,3 +1,8 @@
+import platform
+
+# Windows 不支持 flash_attn，使用 PyTorch 内置的 sdpa；Linux 服务器使用 flash_attention_2
+ATTN_IMPLEMENTATION = "sdpa" if platform.system() == "Windows" else "flash_attention_2"
+
 IGNORE_INDEX = -100
 IMAGE_TOKEN_INDEX = -200
 DEFAULT_IMAGE_TOKEN = "<image>"

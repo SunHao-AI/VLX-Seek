@@ -120,6 +120,8 @@ python inference.py \
   --task detection \
   --text "橘子; 苹果" \
   --lang zh
+
+python inference.py --model-path omlab/VLX-Seek-1.5-10B --image-path demo/demo_image.jpg --task detection --text "橘子; 苹果" --lang zh
 ```
 
 首次运行会自动从 Hugging Face 下载并缓存 VLX-Seek 权重。请先完成本仓库依赖安装，模型结构由本地 `vlx_seek` 包提供。

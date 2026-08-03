@@ -118,6 +118,8 @@ python inference.py \
   --image-path demo/demo_image.jpg \
   --task detection \
   --text "orange; apple"
+
+python inference.py --model-path omlab/VLX-Seek-1.5-10B --image-path demo/demo_image.jpg --task detection --text "橘子; 苹果" --lang zh
 ```
 
 The first run will download and cache the VLX-Seek weights from Hugging Face. Make sure you have cloned this repository and installed the dependencies first, since the model architecture is provided by the local `vlx_seek` package.

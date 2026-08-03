@@ -5,4 +5,4 @@ gradio
 timm==1.0.9
 einops==0.6.1
 accelerate==1.4.0
-flash_attn==2.8.3
+flash_attn==2.8.3  # Windows 不支持，使用 PyTorch 内置实现

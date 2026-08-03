@@ -1,6 +1,7 @@
 from transformers import AutoTokenizer
 import torch
 from vlx_seek.models.vlx_seek_1_5 import VLXSeek1_5ForCausalLM
+from vlx_seek.models.vlx_seek_1_5.constants import ATTN_IMPLEMENTATION
 
 
 def load_pretrained_model(model_path, device="cuda", dtype=torch.bfloat16):
@@ -24,7 +25,7 @@ def load_pretrained_model(model_path, device="cuda", dtype=torch.bfloat16):
         model = VLXSeek1_5ForCausalLM.from_pretrained(
                 model_path,
                 low_cpu_mem_usage=True,
-                attn_implementation="flash_attention_2",
+                attn_implementation=ATTN_IMPLEMENTATION,
                 **kwargs
             )
     else:
