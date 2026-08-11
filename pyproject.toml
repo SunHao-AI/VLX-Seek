@@ -37,7 +37,7 @@ distill = [
 python-preference = "only-managed"
 package = false
 # 使用国内 PyPI 镜像加速依赖下载（阿里云优先；备选清华 https://pypi.tuna.tsinghua.edu.cn/simple）
-default-index = "https://mirrors.aliyun.com/pypi/simple/"
+index-url = "https://mirrors.aliyun.com/pypi/simple/"
 
 [tool.uv.sources]
 # cv_utils 从 gitee 仓库安装（PyPI 无对应版本时）
