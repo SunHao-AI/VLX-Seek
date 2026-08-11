@@ -6,8 +6,10 @@
 
 ```
 distill/
-├── generate_pseudo_labels.py   # 步骤1：VLX-Seek → COCO 伪标签
-├── finetune_yolo_world.py      # 步骤2：COCO → 官方 YOLO-World 微调
+├── extract_image_urls.py       # 步骤1：从 json 中抽取 imageUrl 索引
+├── download_images.py          # 步骤2：按 URL 列表并发下载图片
+├── generate_pseudo_labels.py   # 步骤3：VLX-Seek → COCO 伪标签
+├── finetune_yolo_world.py      # 步骤4：COCO → 官方 YOLO-World 微调
 ├── coco_utils.py               # 共享 COCO 工具（坐标转换/划分/转 YOLO txt）
 └── examples/                   # 端到端示例数据
     ├── images/                 #   demo 图片（demo_image.jpg / demo_image2.jpg）
@@ -16,10 +18,33 @@ distill/
 
 ## 环境要求
 
-- **步骤1（伪标签生成）**：需要 GPU + VLX-Seek 权重（`resources/VLX-Seek-1.5-10B`）与 WeDetect 权重（`resources/wedetect_base_uni.pth`，缺失时自动下载）。依赖见项目根 `requirements.txt`。
-- **步骤2（微调）**：需要额外安装 `ultralytics`（`pip install ultralytics`），建议独立虚拟环境，避免与项目 `torch 2.10 / transformers 5.13` 冲突。训练需足够内存/GPU。
+- **步骤1/2（抽取索引、下载图片）**：仅需 `requests`（`pip install requests`），纯 CPU 即可。
+- **步骤3（伪标签生成）**：需要 GPU + VLX-Seek 权重（`resources/VLX-Seek-1.5-10B`）与 WeDetect 权重（`resources/wedetect_base_uni.pth`，缺失时自动下载）。依赖见项目根 `requirements.txt`。
+- **步骤4（微调）**：需要额外安装 `ultralytics`（`pip install ultralytics`），建议独立虚拟环境，避免与项目 `torch 2.10 / transformers 5.13` 冲突。训练需足够内存/GPU。
 
-## 步骤1：生成伪标签
+## 步骤1：抽取图片索引
+
+从标注 json 中抽取以指定前缀开头的 `imageUrl`，写入 URL 列表文件（每行一个）。
+
+```bash
+python distill/extract_image_urls.py <目标文件夹> <输出文件> [--workers N] [--prefix PREFIX]
+```
+
+- 递归遍历目标文件夹下所有 json 文件，匹配 `imageUrl` 字段。
+- 默认前缀 `http://fsimage.guihuao.com`，可用 `--prefix` 覆盖。
+
+## 步骤2：下载图片
+
+读取 URL 列表文件，并发下载图片到指定目录；下载成功的 URL 会从列表中移除（失败/跳过的保留，便于重试）。
+
+```bash
+python distill/download_images.py <url_file> <download_dir> [选项]
+```
+
+- 支持 `-n/--num`（只下载前 N 张）、`--workers`（并发数）、`--dedup-mode`（去重模式）、`--timeout`、`--retries`、`--no-skip-existing`。
+- 已存在且非空的文件默认跳过，可断点续跑。
+
+## 步骤3：生成伪标签
 
 ```bash
 python distill/generate_pseudo_labels.py \
@@ -31,10 +56,10 @@ python distill/generate_pseudo_labels.py \
 ```
 
 - 每张图先用 WeDetect 生成候选区域（proposals），再调 VLX-Seek 开放词汇检测，输出 `{label, bbox}` 写入 COCO。
-- 支持 `--resume` 断点续跑、`--start/--end-index` 分片、`--min-area` 过滤小框。
+- 支持 `--resume` 断点续跑、`--start/--end-index` 分片、`--min-area` 过滤小框、`--gpu-ids` 多卡并行。
 - 类别按 `--categories` 精确匹配 VLX-Seek 输出的 label（忽略大小写），不匹配的框会被丢弃。
 
-## 步骤2：微调 YOLO-World
+## 步骤4：微调 YOLO-World
 
 ```bash
 python distill/finetune_yolo_world.py \

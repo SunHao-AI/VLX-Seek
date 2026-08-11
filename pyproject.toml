@@ -1,0 +1,42 @@
+[project]
+name = "vlx-seek"
+version = "1.5.0"
+description = "VLX-Seek: 基于视觉语言模型的目标检测与定位推理项目"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "torch==2.10.0",
+    "torchvision==0.25.0",
+    "transformers==5.13.0",
+    "gradio",
+    "timm==1.0.9",
+    "einops==0.6.1",
+    "accelerate==1.4.0",
+    # distill 步骤1/2：下载图片
+    "requests",
+    # distill 步骤3：generate_pseudo_labels.py 使用 PIL.Image
+    "Pillow",
+    # distill 步骤3：generate_pseudo_labels.py 使用 cv_utils.inference.CropImage 滑窗裁剪
+    "cv-utils",
+    # flash_attn 在 Windows 上不支持，使用 PyTorch 内置实现；
+    # 仅在 Linux 平台安装（见 optional-dependencies.flash-attn）
+]
+
+[project.optional-dependencies]
+# Linux 环境可启用 flash attention 加速
+flash-attn = [
+    "flash_attn==2.8.3",
+]
+# distill 步骤4：微调 YOLO-World（建议独立环境，避免与 torch 2.10/transformers 5.13 冲突）
+distill = [
+    "ultralytics",
+]
+
+[tool.uv]
+# 固定 Python 版本，保证虚拟环境一致性
+python-preference = "only-managed"
+package = false
+
+[tool.uv.sources]
+# cv_utils 从 gitee 仓库安装（PyPI 无对应版本时）
+cv-utils = { git = "https://gitee.com/SunHao-AI/cv_utils.git" }
