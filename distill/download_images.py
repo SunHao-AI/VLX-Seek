@@ -139,8 +139,7 @@ def _remove_done(url_file, done_urls):
     return removed
 
 
-def download_images(url_file, download_dir, n=None, workers=8,
-                    dedup_mode="exact", timeout=15, retries=3, skip_existing=True):
+def download_images(url_file, download_dir, n=None, workers=8, dedup_mode="exact", timeout=15, retries=3, skip_existing=True):
     """
     手动触发下载：读取 url_file，去重后并发下载图片到 download_dir，
     下载成功的 URL 会从 url_file 中移除。
@@ -171,8 +170,7 @@ def download_images(url_file, download_dir, n=None, workers=8,
 
     # 3) 下载
     os.makedirs(download_dir, exist_ok=True)
-    tasks = [(u, download_dir, timeout, retries, i, skip_existing)
-             for i, u in enumerate(to_download, 1)]
+    tasks = [(u, download_dir, timeout, retries, i, skip_existing) for i, u in enumerate(to_download, 1)]
 
     ok = fail = skipped = 0
     done_urls, failed_urls = [], []
@@ -196,8 +194,7 @@ def download_images(url_file, download_dir, n=None, workers=8,
 
     # 4) 从 url_file 中移除已成功下载的 URL（失败/跳过的保留，便于重试）
     removed_from_file = _remove_done(url_file, done_urls)
-    print("\n下载完成："
-          f"成功 {ok:,} | 失败 {fail:,} | 已存在跳过 {skipped:,} | 耗时 {time.time()-t0:.1f} 秒")
+    print("\n下载完成：" f"成功 {ok:,} | 失败 {fail:,} | 已存在跳过 {skipped:,} | 耗时 {time.time()-t0:.1f} 秒")
     print(f"已从 {url_file} 移除 {removed_from_file:,} 条已下载 URL，剩余 {max(len(urls)-removed_from_file,0):,} 条")
     return {
         "total": len(deduped),
@@ -211,24 +208,15 @@ def download_images(url_file, download_dir, n=None, workers=8,
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="读取 URL 列表文件, 并发下载图片到指定目录, "
-                    "下载成功的 URL 会从文件中移除")
+    parser = argparse.ArgumentParser(description="读取 URL 列表文件, 并发下载图片到指定目录, " "下载成功的 URL 会从文件中移除")
     parser.add_argument("url_file", help="输入: 包含图片 URL 的文本文件路径")
     parser.add_argument("download_dir", help="输出: 图片保存目录(不存在会自动创建)")
-    parser.add_argument("-n", "--num", type=int, default=None,
-                        help="本次只下载前 N 张(去重后); 默认全部")
-    parser.add_argument("--workers", type=int, default=8,
-                        help="并发下载线程数(默认 8)")
-    parser.add_argument("--dedup-mode", choices=["exact", "casefold", "id"],
-                        default="exact",
-                        help="去重模式: exact 精确 / casefold 忽略大小写 / id 按图片ID(默认: %(default)s)")
-    parser.add_argument("--timeout", type=int, default=15,
-                        help="单次请求超时秒数(默认 15)")
-    parser.add_argument("--retries", type=int, default=3,
-                        help="失败重试次数(默认 3)")
-    parser.add_argument("--no-skip-existing", action="store_true",
-                        help="不跳过已存在且非空的文件(默认跳过)")
+    parser.add_argument("-n", "--num", type=int, default=None, help="本次只下载前 N 张(去重后); 默认全部")
+    parser.add_argument("--workers", type=int, default=8, help="并发下载线程数(默认 8)")
+    parser.add_argument("--dedup-mode", choices=["exact", "casefold", "id"], default="exact", help="去重模式: exact 精确 / casefold 忽略大小写 / id 按图片ID(默认: %(default)s)")
+    parser.add_argument("--timeout", type=int, default=15, help="单次请求超时秒数(默认 15)")
+    parser.add_argument("--retries", type=int, default=3, help="失败重试次数(默认 3)")
+    parser.add_argument("--no-skip-existing", action="store_true", help="不跳过已存在且非空的文件(默认跳过)")
     args = parser.parse_args()
 
     result = download_images(
@@ -242,6 +230,7 @@ def main():
         skip_existing=not args.no_skip_existing,
     )
     # 若需要查看失败项, 可打印 result["failed_urls"]
+    print(result["failed_urls"])
 
 
 if __name__ == "__main__":
