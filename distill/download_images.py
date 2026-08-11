@@ -8,15 +8,19 @@
   3. 并发下载图片到 download_dir（失败自动重试、已存在的文件自动跳过）
   4. 下载成功的 URL 会从 url_file 中移除（失败/跳过的保留，便于下次重试）
 
-用法（手动触发下载）：
-    >>> import download_images as di
-    >>> di.download_images("urls.txt", "D:/我的图片")           # 最简单的调用
-    >>> di.download_images("urls.txt", "images", workers=16)    # 指定并发数
-    >>> di.download_images("urls.txt", "images", n=100)         # 只下载前100张
+用法（命令行）：
+    python download_images.py <url_file> <download_dir> [选项]
 
-    或者在文件末尾的 if __name__ == "__main__" 里填好路径后直接运行本文件。
+示例：
+    python download_images.py urls.txt images                     # 全部下载
+    python download_images.py urls.txt images -n 100              # 只下载前100张
+    python download_images.py urls.txt images --workers 16        # 指定并发数
+    python download_images.py urls.txt images --dedup-mode id     # 按图片ID去重
+
+    也可作为模块导入调用 download_images() 函数。
 """
 
+import argparse
 import os
 import re
 import time
@@ -206,10 +210,39 @@ def download_images(url_file, download_dir, n=None, workers=8,
     }
 
 
+def main():
+    parser = argparse.ArgumentParser(
+        description="读取 URL 列表文件, 并发下载图片到指定目录, "
+                    "下载成功的 URL 会从文件中移除")
+    parser.add_argument("url_file", help="输入: 包含图片 URL 的文本文件路径")
+    parser.add_argument("download_dir", help="输出: 图片保存目录(不存在会自动创建)")
+    parser.add_argument("-n", "--num", type=int, default=None,
+                        help="本次只下载前 N 张(去重后); 默认全部")
+    parser.add_argument("--workers", type=int, default=8,
+                        help="并发下载线程数(默认 8)")
+    parser.add_argument("--dedup-mode", choices=["exact", "casefold", "id"],
+                        default="exact",
+                        help="去重模式: exact 精确 / casefold 忽略大小写 / id 按图片ID(默认: %(default)s)")
+    parser.add_argument("--timeout", type=int, default=15,
+                        help="单次请求超时秒数(默认 15)")
+    parser.add_argument("--retries", type=int, default=3,
+                        help="失败重试次数(默认 3)")
+    parser.add_argument("--no-skip-existing", action="store_true",
+                        help="不跳过已存在且非空的文件(默认跳过)")
+    args = parser.parse_args()
+
+    result = download_images(
+        args.url_file,
+        args.download_dir,
+        n=args.num,
+        workers=args.workers,
+        dedup_mode=args.dedup_mode,
+        timeout=args.timeout,
+        retries=args.retries,
+        skip_existing=not args.no_skip_existing,
+    )
+    # 若需要查看失败项, 可打印 result["failed_urls"]
+
+
 if __name__ == "__main__":
-    # ====== 在这里填好路径，然后运行本文件即可手动触发下载 ======
-    INPUT_FILE = "urls.txt"          # 输入：URL 列表文件
-    OUTPUT_DIR = "images"            # 下载：图片保存文件夹
-    N = 100                          # 本次只下载前 N 张；None 表示全部
-    result = download_images(INPUT_FILE, OUTPUT_DIR, n=N, workers=8)
-    # 若需要查看失败项，可打印 result["failed_urls"]
+    main()
