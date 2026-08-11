@@ -153,10 +153,8 @@ def ensure_wedetect_checkpoint(checkpoint_path: str) -> Path:
     return checkpoint
 
 
-def load_wedetect_proposals(
-    image: Image.Image, checkpoint_path: str
-) -> list[list[float]]:
-    """Generate the top 100 WeDetect-Uni xyxy proposals in original pixels."""
+def _build_wedetect_model(checkpoint_path: str):
+    """Build and return a WeDetect-Uni proposal model (kept resident for reuse)."""
     checkpoint = ensure_wedetect_checkpoint(checkpoint_path)
 
     wedetect_dir = Path(__file__).resolve().parent / "detect_tools" / "WeDetect"
@@ -194,12 +192,37 @@ def load_wedetect_proposals(
             state_dict[new_key] = state_dict.pop(key)
 
     model.load_state_dict(state_dict, strict=False)
-    model = model.cuda().eval()
-    with torch.inference_mode():
-        outputs = model([image])
-        boxes = outputs[0]["bboxes"].float().cpu().tolist()
+    return model.cuda().eval()
 
-    del outputs, model
+
+class WeDetectProposalGenerator:
+    """Reusable WeDetect-Uni proposal generator (model kept resident).
+
+    Useful when generating proposals for many crops/images in one process,
+    avoiding reloading the checkpoint every call.
+    """
+
+    def __init__(self, checkpoint_path: str):
+        self.model = _build_wedetect_model(checkpoint_path)
+
+    def __call__(self, image: Image.Image) -> list[list[float]]:
+        import torch
+
+        with torch.inference_mode():
+            outputs = self.model([image])
+            boxes = outputs[0]["bboxes"].float().cpu().tolist()
+        return boxes
+
+
+def load_wedetect_proposals(
+    image: Image.Image, checkpoint_path: str
+) -> list[list[float]]:
+    """Generate the top 100 WeDetect-Uni xyxy proposals in original pixels."""
+    generator = WeDetectProposalGenerator(checkpoint_path)
+    boxes = generator(image)
+    del generator
+    import torch
+
     torch.cuda.empty_cache()
     return boxes
 
