@@ -8,8 +8,9 @@
 distill/
 ├── extract_image_urls.py       # 步骤1：从 json 中抽取 imageUrl 索引
 ├── download_images.py          # 步骤2：按 URL 列表并发下载图片
-├── generate_pseudo_labels.py   # 步骤3：VLX-Seek → COCO 伪标签
-├── finetune_yolo_world.py      # 步骤4：COCO → 官方 YOLO-World 微调
+├── generate_prompts.py         # 步骤3：从检测服务生成 VLX-Seek 类别 prompt
+├── generate_pseudo_labels.py   # 步骤4：VLX-Seek → COCO 伪标签
+├── finetune_yolo_world.py      # 步骤5：COCO → 官方 YOLO-World 微调
 ├── coco_utils.py               # 共享 COCO 工具（坐标转换/划分/转 YOLO txt）
 └── examples/                   # 端到端示例数据
     ├── images/                 #   demo 图片（demo_image.jpg / demo_image2.jpg）
@@ -44,7 +45,22 @@ python distill/download_images.py <url_file> <download_dir> [选项]
 - 支持 `-n/--num`（只下载前 N 张）、`--workers`（并发数）、`--dedup-mode`（去重模式）、`--timeout`、`--retries`、`--no-skip-existing`。
 - 已存在且非空的文件默认跳过，可断点续跑。
 
-## 步骤3：生成伪标签
+## 步骤3：生成 VLX-Seek 类别 prompt
+
+从检测服务获取全部类别信息，生成 VLX-Seek 推理用的类别 prompt 映射，供步骤4 伪标签生成使用。
+
+```bash
+python distill/generate_prompts.py
+```
+
+- 请求 `GET /v2/detect/all_class`，解析出全部 中文类别 <=> 英文类别 映射。
+- 输出 `distill/data/category_prompts.json`，结构为 `{all_prompt, categories}`：
+  - `all_prompt`：用 VLX-Seek 检测模板把全部类别 prompt 拼接而成，可直接用于整图开放词汇检测。
+  - `categories`：每个中文类别含 `en_label`（英文名）、`prompt`（推理文本，默认中文名）、`models`（所属任务列表）。
+- `prompt` 可手动改成更精确的描述（如 `"卫星锅"` → `"接收电视信号的卫星天线"`）；再次运行会保留手动修改，仅更新 `en_label`/`models`。
+- 可选参数：`--url`（接口地址）、`--output`（输出路径）、`--timeout`。
+
+## 步骤4：生成伪标签
 
 ```bash
 python distill/generate_pseudo_labels.py \
@@ -59,7 +75,7 @@ python distill/generate_pseudo_labels.py \
 - 支持 `--resume` 断点续跑、`--start/--end-index` 分片、`--min-area` 过滤小框、`--gpu-ids` 多卡并行。
 - 类别按 `--categories` 精确匹配 VLX-Seek 输出的 label（忽略大小写），不匹配的框会被丢弃。
 
-## 步骤4：微调 YOLO-World
+## 步骤5：微调 YOLO-World
 
 ```bash
 python distill/finetune_yolo_world.py \
