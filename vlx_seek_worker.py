@@ -307,6 +307,85 @@ class VLXSeekWorker:
             image, "detection", categories, bbox_list=bbox_list, **kwargs
         )
 
+    def encode_image_cache(
+        self,
+        image: Image.Image,
+        boxes: Optional[Sequence[Sequence[float]]] = None,
+    ) -> None:
+        """预计算并缓存图片特征，供后续多次 detect() 复用。
+
+        调用此方法后，模型 forward() 会跳过视觉编码直接使用缓存。
+        推理完成后需调用 clear_image_cache() 释放缓存。
+        """
+        image = image.convert("RGB")
+        caller_boxes = self._validate_boxes(boxes, image)
+        ordered_boxes, _ = self._order_boxes(caller_boxes)
+
+        images, image_grid_thws, images_aux = self._prepare_image_inputs(
+            image, ordered_boxes
+        )
+
+        # 编码图片特征 → 语言空间投影
+        image_embeds, _, vt_multi_level_features = self.model.encode_images(
+            images, image_grid_thws
+        )
+        image_embeds = torch.cat(image_embeds, dim=0)
+
+        # 编码 object features（如果有 bbox，用于 region-level 检测）
+        object_features = None
+        if images_aux and ordered_boxes:
+            vision_tower = self.model.get_vision_tower()
+            patch_size = vision_tower.config.patch_size
+            vt_images_size = [thw[0][-2:] * patch_size for thw in image_grid_thws]
+            tmp_images_aux = [aux.unsqueeze(0) for aux in images_aux]
+            object_features = self.model.encode_objects(
+                tmp_images_aux,
+                [torch.tensor(ordered_boxes)],
+                vt_multi_level_features,
+                vt_images_size,
+            )
+
+        self.model.set_cached_image(
+            image_embeds=image_embeds,
+            image_grid_thws=image_grid_thws,
+            vt_multi_level_features_list=vt_multi_level_features,
+            object_features=object_features,
+        )
+
+    def clear_image_cache(self) -> None:
+        """清除图片特征缓存。"""
+        self.model.clear_cached_image()
+
+    def detect_multi_prompt(
+        self,
+        image: Image.Image,
+        bbox_list: Sequence[Sequence[float]],
+        category_batches: list[list[str]],
+        **kwargs,
+    ) -> dict:
+        """多组类别分批检测，合并结果。
+
+        需先调用 encode_image_cache() 预编码图片特征，本方法循环调用
+        detect() 时会复用缓存。完成后需调用 clear_image_cache()。
+
+        Returns:
+            与 detect() 相同格式的 dict，result_bbox_list 为所有批次的并集。
+        """
+        merged: dict = {
+            "answer": "",
+            "result_bbox_list": [],
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+        }
+        for batch in category_batches:
+            result = self.detect(image, bbox_list, batch, **kwargs)
+            merged["result_bbox_list"].extend(result.get("result_bbox_list", []))
+            if result.get("answer"):
+                merged["answer"] += result["answer"] + "\n"
+            merged["prompt_tokens"] += result.get("prompt_tokens", 0)
+            merged["completion_tokens"] += result.get("completion_tokens", 0)
+        return merged
+
     def ground(
         self,
         image: Image.Image,

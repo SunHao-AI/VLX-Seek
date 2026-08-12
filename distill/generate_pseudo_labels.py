@@ -54,6 +54,13 @@ from coco_utils import save_coco, xyxy_to_xywh  # noqa: E402
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
 
+def _split_categories(categories: list[str], batch_size: int) -> list[list[str]]:
+    """将类别列表按 batch_size 分批。batch_size<=0 或类别数<=batch_size 时返回单批。"""
+    if batch_size <= 0 or len(categories) <= batch_size:
+        return [categories]
+    return [categories[i:i + batch_size] for i in range(0, len(categories), batch_size)]
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="VLX-Seek 生成 COCO 伪标签")
     parser.add_argument("--image-dir", required=True, help="输入图像目录")
@@ -91,6 +98,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--slice-height", type=int, default=1000, help="裁剪块高度（像素）")
     parser.add_argument("--overlap-width-ratio", type=float, default=0.1, help="宽度方向重叠比例")
     parser.add_argument("--overlap-height-ratio", type=float, default=0.1, help="高度方向重叠比例")
+    parser.add_argument(
+        "--prompt-batch-size",
+        type=int,
+        default=0,
+        help="每个子提示词包含的类别数上限。0 表示不拆分（默认）。设为 30 则每 30 个类别一组循环推理。",
+    )
     return parser.parse_args()
 
 
@@ -162,16 +175,30 @@ def detect_with_crop(
             crop = slc.image
             try:
                 boxes = generator(crop)
-                result = worker.detect(
-                    crop,
-                    boxes,
-                    categories,
-                    lang=args.lang,
-                    max_new_tokens=args.max_new_tokens,
-                    temperature=args.temperature,
-                )
+                if args.prompt_batch_size > 0 and len(categories) > args.prompt_batch_size:
+                    category_batches = _split_categories(categories, args.prompt_batch_size)
+                    worker.encode_image_cache(crop, boxes)
+                    result = worker.detect_multi_prompt(
+                        crop,
+                        boxes,
+                        category_batches,
+                        lang=args.lang,
+                        max_new_tokens=args.max_new_tokens,
+                        temperature=args.temperature,
+                    )
+                    worker.clear_image_cache()
+                else:
+                    result = worker.detect(
+                        crop,
+                        boxes,
+                        categories,
+                        lang=args.lang,
+                        max_new_tokens=args.max_new_tokens,
+                        temperature=args.temperature,
+                    )
             except Exception as exc:  # 单个裁剪块失败不中断整体
                 print(f"裁剪推理失败: {exc}", file=sys.stderr)
+                worker.clear_image_cache()
                 continue
 
             shapes = []
@@ -253,6 +280,16 @@ def run_pipeline(args: argparse.Namespace, image_paths: list[Path] | None = None
     next_image_id = max((img["id"] for img in coco["images"]), default=-1) + 1
     next_ann_id = max((ann["id"] for ann in coco["annotations"]), default=-1) + 1
 
+    # 类别分批日志
+    use_batch = args.prompt_batch_size > 0 and len(categories) > args.prompt_batch_size
+    if use_batch:
+        n_batches = len(_split_categories(categories, args.prompt_batch_size))
+        print(
+            f"类别分批: {len(categories)} 个类别 → {n_batches} 批，"
+            f"每批 ≤{args.prompt_batch_size} 个",
+            file=sys.stderr,
+        )
+
     total = len(image_paths)
     for i, img_path in enumerate(image_paths):
         if img_path.name in done_names:
@@ -266,6 +303,23 @@ def run_pipeline(args: argparse.Namespace, image_paths: list[Path] | None = None
                 detections = detect_with_crop(
                     image, worker, categories, args, cat_id_map
                 )
+            elif use_batch:
+                category_batches = _split_categories(categories, args.prompt_batch_size)
+                boxes = load_proposals(image, args.detector_checkpoint)
+                worker.encode_image_cache(image, boxes)
+                result = worker.detect_multi_prompt(
+                    image,
+                    boxes,
+                    category_batches,
+                    lang=args.lang,
+                    max_new_tokens=args.max_new_tokens,
+                    temperature=args.temperature,
+                )
+                worker.clear_image_cache()
+                detections = [
+                    (rb["label"], rb["xmin"], rb["ymin"], rb["xmax"], rb["ymax"])
+                    for rb in result.get("result_bbox_list", [])
+                ]
             else:
                 boxes = load_proposals(image, args.detector_checkpoint)
                 result = worker.detect(
@@ -282,6 +336,8 @@ def run_pipeline(args: argparse.Namespace, image_paths: list[Path] | None = None
                 ]
         except Exception as exc:  # 单张失败不中断整体
             print(f"[{i + 1}/{total}] 失败 {img_path.name}: {exc}", file=sys.stderr)
+            if use_batch:
+                worker.clear_image_cache()
             continue
 
         image_id = next_image_id

@@ -75,6 +75,32 @@ python distill/generate_pseudo_labels.py \
 - 支持 `--resume` 断点续跑、`--start/--end-index` 分片、`--min-area` 过滤小框、`--gpu-ids` 多卡并行。
 - 类别按 `--categories` 精确匹配 VLX-Seek 输出的 label（忽略大小写），不匹配的框会被丢弃。
 
+### 使用全部类别 + 提示词分批
+
+检测全部类别（`distill/data/category_prompts.json` 的 `all_prompt` 字段）时，提示词过长会导致 VLX-Seek 效果下降。此时应从 `all_prompt` 中提取全部类别并配合 `--prompt-batch-size` 分批循环推理：
+
+```powershell
+# 从 all_prompt 提取全部类别（去掉前缀 "Detect all the instances of: "，按分号分割）
+# 输出分号分隔的类别列表，直接作为 --categories 传参
+python -c "import json; data = json.load(open('distill/data/category_prompts.json', encoding='utf-8')); prompt = data['all_prompt']; body = prompt.split(': ', 1)[1].rstrip('.'); cats = [c.strip() for c in body.split(';') if c.strip()]; print('; '.join(cats))"
+```
+
+```bash
+# 例如：280 个类别（当前 all_prompt 实际数量），每 30 个一组循环推理
+python distill/generate_pseudo_labels.py \
+  --image-dir data/images \
+  --categories "人群密集; 道路施工区域或施工场景; 水面浑浊、不洁的水体; ..." \
+  --output data/pseudo_labels.json \
+  --model-path resources/VLX-Seek-1.5-10B \
+  --device cuda \
+  --prompt-batch-size 30
+```
+
+- `--prompt-batch-size N`：每个子提示词最多包含 N 个类别，类别超过 N 时自动拆成多个子提示词循环推理（如 280 个类别 + `--prompt-batch-size 30` → 10 轮）。
+- 分批模式下同一张图（或裁剪块）的图片特征只编码一次（视觉编码器 + 文本 embedding 复用），仅文本提示词随批次变化，可显著减少重复视觉编码开销。
+- 默认值为 0，表示不拆分，行为与未启用该参数一致。
+- 注意：`--categories` 传的是类别名列表（分号分隔），不是整段 `all_prompt` 文本；`all_prompt` 开头的 `Detect all the instances of:` 前缀由脚本内部的检测模板自动添加。
+
 ## 步骤5：微调 YOLO-World
 
 ```bash
