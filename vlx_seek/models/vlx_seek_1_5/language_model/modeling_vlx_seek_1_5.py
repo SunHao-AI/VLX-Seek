@@ -385,6 +385,20 @@ class VLXSeek1_5ForCausalLM(Qwen3_5ForConditionalGeneration, OmChatMetaForCausal
     def get_model(self):
         return self.model
 
+    def encode_images(self, images, images_grid_thw=None):
+        return self.model.encode_images(images, images_grid_thw)
+
+    def encode_objects(self, images, bbox_list, vt_multi_level_features=None, vt_images_size=None, add_pos_embed=True):
+        return self.model.encode_objects(
+            images, bbox_list, vt_multi_level_features, vt_images_size, add_pos_embed
+        )
+
+    def set_cached_image(self, **kwargs):
+        return self.model.set_cached_image(**kwargs)
+
+    def clear_cached_image(self):
+        return self.model.clear_cached_image()
+
     def convert_input_ids(self, input_ids, image_grid_thws, attention_mask=None, labels=None):
         if image_grid_thws is None or len(image_grid_thws) == 0:
             return input_ids, attention_mask, labels
