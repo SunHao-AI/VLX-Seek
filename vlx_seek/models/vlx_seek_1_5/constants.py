@@ -1,7 +1,14 @@
+import importlib.util
 import platform
 
-# Windows 不支持 flash_attn，使用 PyTorch 内置的 sdpa；Linux 服务器使用 flash_attention_2
-ATTN_IMPLEMENTATION = "sdpa" if platform.system() == "Windows" else "flash_attention_2"
+# Windows 不支持 flash_attn，使用 PyTorch 内置的 sdpa；Linux 服务器使用 flash_attention_2，
+# 未安装 flash-attn 时自动回退 sdpa（避免 from_pretrained 时抛 ImportError）
+if platform.system() == "Windows":
+    ATTN_IMPLEMENTATION = "sdpa"
+elif importlib.util.find_spec("flash_attn") is not None:
+    ATTN_IMPLEMENTATION = "flash_attention_2"
+else:
+    ATTN_IMPLEMENTATION = "sdpa"
 
 IGNORE_INDEX = -100
 IMAGE_TOKEN_INDEX = -200
