@@ -33,6 +33,7 @@
     VLX-Seek，再合并回原图坐标。适合大图小目标场景。可用 --slice-width /
     --slice-height / --overlap-width-ratio / --overlap-height-ratio 调整。
 """
+
 from __future__ import annotations
 
 import argparse
@@ -58,7 +59,7 @@ def _split_categories(categories: list[str], batch_size: int) -> list[list[str]]
     """将类别列表按 batch_size 分批。batch_size<=0 或类别数<=batch_size 时返回单批。"""
     if batch_size <= 0 or len(categories) <= batch_size:
         return [categories]
-    return [categories[i:i + batch_size] for i in range(0, len(categories), batch_size)]
+    return [categories[i : i + batch_size] for i in range(0, len(categories), batch_size)]
 
 
 def parse_args() -> argparse.Namespace:
@@ -74,7 +75,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--detector-checkpoint",
         default="resources/wedetect_base_uni.pth",
-        help="WeDetect 候选区域检测器权重；缺失时自动从 Hugging Face 下载。",
+        help="WeDetect 候选区域检测器权重。默认优先在 --model-path 目录下查找" " wedetect_base_uni.pth，其次用 resources/wedetect_base_uni.pth；" "仍缺失时自动从 Hugging Face 下载。",
     )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--lang", choices=("en", "zh"), default="en")
@@ -235,9 +236,7 @@ def detect_with_crop(
 
 
 def collect_image_paths(image_dir: str) -> list[Path]:
-    paths = sorted(
-        p for p in Path(image_dir).iterdir() if p.suffix.lower() in IMAGE_EXTS
-    )
+    paths = sorted(p for p in Path(image_dir).iterdir() if p.suffix.lower() in IMAGE_EXTS)
     if not paths:
         raise FileNotFoundError(f"目录中没有图片: {image_dir}")
     return paths
@@ -285,8 +284,7 @@ def run_pipeline(args: argparse.Namespace, image_paths: list[Path] | None = None
     if use_batch:
         n_batches = len(_split_categories(categories, args.prompt_batch_size))
         print(
-            f"类别分批: {len(categories)} 个类别 → {n_batches} 批，"
-            f"每批 ≤{args.prompt_batch_size} 个",
+            f"类别分批: {len(categories)} 个类别 → {n_batches} 批，" f"每批 ≤{args.prompt_batch_size} 个",
             file=sys.stderr,
         )
 
@@ -300,9 +298,7 @@ def run_pipeline(args: argparse.Namespace, image_paths: list[Path] | None = None
 
         try:
             if args.crop_inference:
-                detections = detect_with_crop(
-                    image, worker, categories, args, cat_id_map
-                )
+                detections = detect_with_crop(image, worker, categories, args, cat_id_map)
             elif use_batch:
                 category_batches = _split_categories(categories, args.prompt_batch_size)
                 boxes = load_proposals(image, args.detector_checkpoint)
@@ -316,10 +312,7 @@ def run_pipeline(args: argparse.Namespace, image_paths: list[Path] | None = None
                     temperature=args.temperature,
                 )
                 worker.clear_image_cache()
-                detections = [
-                    (rb["label"], rb["xmin"], rb["ymin"], rb["xmax"], rb["ymax"])
-                    for rb in result.get("result_bbox_list", [])
-                ]
+                detections = [(rb["label"], rb["xmin"], rb["ymin"], rb["xmax"], rb["ymax"]) for rb in result.get("result_bbox_list", [])]
             else:
                 boxes = load_proposals(image, args.detector_checkpoint)
                 result = worker.detect(
@@ -330,10 +323,7 @@ def run_pipeline(args: argparse.Namespace, image_paths: list[Path] | None = None
                     max_new_tokens=args.max_new_tokens,
                     temperature=args.temperature,
                 )
-                detections = [
-                    (rb["label"], rb["xmin"], rb["ymin"], rb["xmax"], rb["ymax"])
-                    for rb in result.get("result_bbox_list", [])
-                ]
+                detections = [(rb["label"], rb["xmin"], rb["ymin"], rb["xmax"], rb["ymax"]) for rb in result.get("result_bbox_list", [])]
         except Exception as exc:  # 单张失败不中断整体
             print(f"[{i + 1}/{total}] 失败 {img_path.name}: {exc}", file=sys.stderr)
             if use_batch:
@@ -342,19 +332,14 @@ def run_pipeline(args: argparse.Namespace, image_paths: list[Path] | None = None
 
         image_id = next_image_id
         next_image_id += 1
-        coco["images"].append(
-            {"id": image_id, "file_name": img_path.name, "width": width, "height": height}
-        )
+        coco["images"].append({"id": image_id, "file_name": img_path.name, "width": width, "height": height})
 
-        next_ann_id = _add_annotations(
-            coco, image_id, detections, cat_id_map, args.min_area, next_ann_id
-        )
+        next_ann_id = _add_annotations(coco, image_id, detections, cat_id_map, args.min_area, next_ann_id)
 
         if (i + 1) % 10 == 0 or (i + 1) == total:
             save_coco(coco, args.output)
             print(
-                f"[{i + 1}/{total}] {img_path.name} 完成，"
-                f"累计 {len(coco['images'])} 图 / {len(coco['annotations'])} 框",
+                f"[{i + 1}/{total}] {img_path.name} 完成，" f"累计 {len(coco['images'])} 图 / {len(coco['annotations'])} 框",
                 file=sys.stderr,
             )
 
@@ -371,9 +356,7 @@ def _split_shards(paths: list[Path], num_shards: int) -> list[list[Path]]:
     return shards
 
 
-def _worker_shard(
-    args: argparse.Namespace, gpu_id: int, shard_paths: list[Path], output_path: str
-) -> None:
+def _worker_shard(args: argparse.Namespace, gpu_id: int, shard_paths: list[Path], output_path: str) -> None:
     """子进程入口：用 CUDA_VISIBLE_DEVICES 隔离到指定 GPU 后处理一份分片。"""
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
     shard_args = argparse.Namespace(**vars(args))
@@ -422,10 +405,7 @@ def run_multigpu(args: argparse.Namespace) -> None:
     shards = _split_shards(image_paths, len(gpu_ids))
 
     output = Path(args.output)
-    shard_outputs = [
-        str(output.with_name(f"{output.stem}.shard{i}.json"))
-        for i in range(len(gpu_ids))
-    ]
+    shard_outputs = [str(output.with_name(f"{output.stem}.shard{i}.json")) for i in range(len(gpu_ids))]
 
     ctx = mp.get_context("spawn")
     processes = []
@@ -451,8 +431,23 @@ def run_multigpu(args: argparse.Namespace) -> None:
     print(f"图像数: {len(merged['images'])}，标注数: {len(merged['annotations'])}")
 
 
+def _resolve_detector_checkpoint(args: argparse.Namespace) -> None:
+    """未显式指定 --detector-checkpoint 时，自动在 --model-path 目录下查找。
+
+    若 <model-path>/wedetect_base_uni.pth 存在则优先使用；否则保留默认的
+    resources/wedetect_base_uni.pth（缺失时仍由下游触发联网下载）。
+    """
+    default = "resources/wedetect_base_uni.pth"
+    if args.detector_checkpoint != default:
+        return  # 用户已显式指定，尊重之
+    candidate = Path(args.model_path) / "wedetect_base_uni.pth"
+    if candidate.is_file():
+        args.detector_checkpoint = str(candidate)
+
+
 def main() -> None:
     args = parse_args()
+    _resolve_detector_checkpoint(args)
     if args.gpu_ids:
         run_multigpu(args)
     else:
