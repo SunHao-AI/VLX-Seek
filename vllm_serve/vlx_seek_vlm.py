@@ -317,25 +317,31 @@ class VLXSeek1_5ForCausalLM(_VllmQwen3_5VLM):
     # 多模态嵌入（vLLM 协议：覆盖 embed_multimodal 处理图像 + object features）
     # ------------------------------------------------------------------
 
-    def embed_multimodal(self, **kwargs: object) -> tuple[torch.Tensor, ...] | None:
+    def embed_multimodal(self, **kwargs: object) -> torch.Tensor | None:
         """覆盖基类方法：图像编码 + object features 编码。
 
-        embeddings 顺序必须与 prompt 中占位符出现顺序一致：
+        vLLM 要求每个 mm item 恰好返回 1 个 embedding（sanity_check_mm_encoder_outputs
+        校验 len(mm_embeddings) == num_items）。图像 + object 属于同一个 image item，
+        必须合并为单个 tensor。
+
+        合并后的行序必须与 prompt 中占位符出现顺序一致：
         先 <|image_pad|>(248056) × N，再 <objfeat>(248181) × M。
-        ``_merge_multimodal_embeddings`` 按此顺序合并到 is_multimodal 掩码。
+        ``_merge_multimodal_embeddings`` 按 is_multimodal 掩码顺序 scatter。
         """
         mm_input_by_modality = self._parse_and_validate_multimodal_inputs(**kwargs)
         if not mm_input_by_modality:
             return None
 
-        multimodal_embeddings: list[torch.Tensor] = []
+        all_embeds: list[torch.Tensor] = []
         for modality in mm_input_by_modality:
             multimodal_input = mm_input_by_modality[modality]
             if modality == "image":
                 embeds = self._process_image_and_object(multimodal_input, kwargs)
-                multimodal_embeddings.extend(embeds)
+                all_embeds.extend(embeds)
 
-        return tuple(multimodal_embeddings)
+        if not all_embeds:
+            return None
+        return torch.cat(all_embeds, dim=0)
 
     def _process_image_and_object(self, image_input, kwargs) -> tuple[torch.Tensor, ...]:
         """编码图像 + object features，返回有序 embeddings tuple。
