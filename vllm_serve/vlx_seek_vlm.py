@@ -38,7 +38,7 @@ from vllm.model_executor.models.qwen3_vl import (
     Qwen3VLDummyInputsBuilder,
 )
 from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
-from vllm.model_executor.models.registry import MULTIMODAL_REGISTRY
+from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import MultiModalFieldConfig
 from vllm.multimodal.processing import PromptReplacement
 
