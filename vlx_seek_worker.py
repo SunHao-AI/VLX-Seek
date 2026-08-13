@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import random
 import re
+import sys
+import time
 from typing import Optional, Sequence, Union
 
 import torch
@@ -48,6 +50,8 @@ class VLXSeekWorker:
         )
         self.image_processor, self.image_processor_aux = image_processors
         self.model.eval()
+        self._cached_inputs = None  # (images, image_grid_thws, images_aux)，与模型图片缓存配套
+        self.log_timing = False     # True 时每次 generate 输出耗时日志
 
     @staticmethod
     def _validate_boxes(
@@ -207,7 +211,13 @@ class VLXSeekWorker:
         top_p: float = 1.0,
         repetition_penalty: float = 1.0,
     ) -> dict:
-        """Answer one image question, optionally using object-region prompts."""
+        """Answer one image question, optionally using object-region prompts.
+
+        Note:
+            调用 ``encode_image_cache()`` 后，命中缓存时本方法复用缓存的
+            图像输入张量（跳过图像预处理），此时 ``image`` 与 ``bbox_list``
+            必须与缓存时完全一致。
+        """
         image = image.convert("RGB")
         caller_boxes = self._validate_boxes(bbox_list, image)
         boxes, sorted_to_original = self._order_boxes(caller_boxes)
@@ -222,7 +232,11 @@ class VLXSeekWorker:
             raw_input_ids = tokenizer_image_token(
                 prompt, self.tokenizer, return_tensors="pt"
             )
-        images, image_grid_thws, images_aux = self._prepare_image_inputs(image, boxes)
+        # 命中图片缓存时复用预处理的输入张量（图与 boxes 必须与缓存一致）
+        if self._cached_inputs is not None:
+            images, image_grid_thws, images_aux = self._cached_inputs
+        else:
+            images, image_grid_thws, images_aux = self._prepare_image_inputs(image, boxes)
         input_ids = self._expand_multimodal_tokens(
             raw_input_ids, image_grid_thws
         ).unsqueeze(0).to(self.device)
@@ -247,7 +261,16 @@ class VLXSeekWorker:
         }
         if do_sample:
             generate_kwargs.update(temperature=temperature, top_p=top_p)
+        start = time.perf_counter()
         output_ids = self.model.generate(**generate_kwargs)
+        elapsed = time.perf_counter() - start
+        completion_tokens = output_ids.shape[1] - input_ids.shape[1]
+        if self.log_timing:
+            print(
+                f"[timing] prompt={input_ids.shape[1]} completion={completion_tokens} "
+                f"{elapsed:.2f}s ({completion_tokens / elapsed:.1f} tok/s)",
+                file=sys.stderr,
+            )
         completion_ids = output_ids[0, input_ids.shape[1] :]
         answer = self.tokenizer.decode(completion_ids, skip_special_tokens=False)
         answer = answer.replace("<|im_end|>", "").strip()
@@ -258,6 +281,7 @@ class VLXSeekWorker:
             "result_bbox_list": result_bbox_list,
             "prompt_tokens": input_ids.shape[1],
             "completion_tokens": completion_ids.shape[0],
+            "elapsed": elapsed,
         }
 
     def predict_batch(
@@ -351,10 +375,12 @@ class VLXSeekWorker:
             vt_multi_level_features_list=vt_multi_level_features,
             object_features=object_features,
         )
+        self._cached_inputs = (images, image_grid_thws, images_aux)
 
     def clear_image_cache(self) -> None:
         """清除图片特征缓存。"""
         self.model.clear_cached_image()
+        self._cached_inputs = None
 
     def detect_multi_prompt(
         self,
