@@ -94,14 +94,8 @@ class VLXSeek1_5ForCausalLM(_VllmQwen3_5VLM):
                 add_pos_embedding=getattr(config, "mm_add_pos_embed", True),
                 pos_embedding_dim=config.mm_object_hidden_size,
                 use_vision_tower_object_feature=getattr(config, "mm_use_vision_tower_object_feature", False),
-                vision_tower_object_feature_dim=(
-                    vision_tower.config.hidden_size * 4
-                    if not getattr(config, "mm_use_simpleFPN_for_vt", False)
-                    else vision_tower.config.out_hidden_size
-                ),
-                vision_tower_spatial_scale=1 / (
-                    vision_tower.config.patch_size * vision_tower.config.spatial_merge_size
-                ),
+                vision_tower_object_feature_dim=(vision_tower.config.hidden_size * 4 if not getattr(config, "mm_use_simpleFPN_for_vt", False) else vision_tower.config.out_hidden_size),
+                vision_tower_spatial_scale=1 / (vision_tower.config.patch_size * vision_tower.config.spatial_merge_size),
                 object_feature_combination=getattr(config, "mm_object_feature_combination", "mean"),
                 use_vt_object_feature_only=getattr(config, "mm_use_vt_object_feature_only", False),
                 use_simpleFPN_for_vt=getattr(config, "mm_use_simpleFPN_for_vt", False),
@@ -191,11 +185,7 @@ class VLXSeek1_5ForCausalLM(_VllmQwen3_5VLM):
                     boxes = torch.tensor([[0, 10, 0, 10]], device=multilevel_visual_feats[0].device, dtype=torch.float32)
                 current_image_height, current_image_width = images[batch_idx].shape[-2:]
                 boxes = boxes.to(torch.float32).to(multilevel_visual_feats[0].device)
-                extracted_object_feat = (
-                    self.object_vp_extractor(multilevel_visual_feats, [boxes], add_pos_embed=add_pos_embed)
-                    .squeeze(0)
-                    .to(dtype=next(self.mm_projector_aux.parameters()).dtype)
-                )
+                extracted_object_feat = self.object_vp_extractor(multilevel_visual_feats, [boxes], add_pos_embed=add_pos_embed).squeeze(0).to(dtype=next(self.mm_projector_aux.parameters()).dtype)
                 object_feat = self.mm_projector_aux(extracted_object_feat)
                 object_features.append(object_feat)
 
@@ -235,9 +225,7 @@ class VLXSeek1_5ForCausalLM(_VllmQwen3_5VLM):
             patch_size = self.get_vision_tower().config.patch_size
             vt_images_size_minibatch = [g[0][-2:] * patch_size for g in image_grid_thws]
             tmp_images_aux = [images_aux[i].unsqueeze(0) for i in range(len(images_aux))]
-            object_features = self.encode_objects(
-                tmp_images_aux, bbox_list, vt_multi_level_features_list, vt_images_size_minibatch
-            )
+            object_features = self.encode_objects(tmp_images_aux, bbox_list, vt_multi_level_features_list, vt_images_size_minibatch)
 
         if object_features:
             # 顺序与占位符一致：图像 token 在前，object token 在后
