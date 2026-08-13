@@ -242,7 +242,7 @@ git commit -m "feat: COCO 解析与导出"
 - YOLO 检测 txt（5 列）→ `Object.bbox_xywh`；seg txt（>5 列，列数-1 为偶数）→ `Object.polygon`。
 - 归一化解析：`cx cy w h` 或 `x1 y1 x2 y2...` 均除以图片宽高反归一化为像素。
 - 解析需图片尺寸：从 `image_dir` 用 `PIL.Image.open` 读取；图片缺失或读取失败 → 跳过该图并告警。
-- 导出：类别 id 沿用 `Object.category_id`（若连续从 0 起始）否则按首次出现分配；class_id 越界/坐标超 [0,1] 均 clamp；归一化保留 6 位小数。
+- 导出：类别 class_id 按类别名首次出现顺序分配（类别名保真）；坐标超 [0,1] 均 clamp；归一化保留 6 位小数。
 - 无标注的图片也写出空 txt。
 - `copy_images` 为真时，源图片路径：`image_dir` 提供则 `image_dir / file_name`，否则 `file_name`（相对 cwd）。
 
@@ -255,12 +255,21 @@ def load_names(names_path: str | Path) -> list[str]:
     if not text:
         return []
     if text.lstrip().startswith("names:") or "path:" in text.splitlines()[0]:
+        # data.yaml 布局（含 path/train/val 等键）：只取 names: 之后 "数字: 类别名" 的行
         names: list[str] = []
-        for line in text.splitlines()[1:]:
-            line = line.strip()
-            if not line or ":" not in line:
+        in_names = False
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("names:"):
+                in_names = True
                 continue
-            _, _, val = line.partition(":")
+            if not in_names:
+                continue
+            if not stripped or ":" not in stripped:
+                continue
+            key, _, val = stripped.partition(":")
+            if not key.strip().isdigit():
+                continue
             names.append(val.strip().strip("\"'"))
         return names
     return [ln.strip() for ln in text.splitlines() if ln.strip()]

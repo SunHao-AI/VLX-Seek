@@ -54,9 +54,10 @@ python distill/generate_prompts.py
 ```
 
 - 请求 `GET /v2/detect/all_class`，解析出全部 中文类别 <=> 英文类别 映射。
-- 输出 `distill/data/category_prompts.json`，结构为 `{all_prompt, categories}`：
+- 输出 `distill/data/category_prompts.json`，结构为 `{all_prompt, categories, prompt_to_category}`：
   - `all_prompt`：用 VLX-Seek 检测模板把全部类别 prompt 拼接而成，可直接用于整图开放词汇检测。
   - `categories`：每个中文类别含 `en_label`（英文名）、`prompt`（推理文本，默认中文名）、`models`（所属任务列表）。
+  - `prompt_to_category`：反向映射 `{推理 prompt: 真实中文类别名}`，供步骤4 把输出 COCO 的 `categories.name` 还原为真实中文类别名。
 - `prompt` 可手动改成更精确的描述（如 `"卫星锅"` → `"接收电视信号的卫星天线"`）；再次运行会保留手动修改，仅更新 `en_label`/`models`。
 - 可选参数：`--url`（接口地址）、`--output`（输出路径）、`--timeout`。
 
@@ -74,6 +75,7 @@ python distill/generate_pseudo_labels.py \
 - 每张图先用 WeDetect 生成候选区域（proposals），再调 VLX-Seek 开放词汇检测，输出 `{label, bbox}` 写入 COCO。
 - 支持 `--resume` 断点续跑、`--start/--end-index` 分片、`--min-area` 过滤小框、`--gpu-ids` 多卡并行。
 - 类别按 `--categories` 精确匹配 VLX-Seek 输出的 label（忽略大小写），不匹配的框会被丢弃。
+- 默认读取 `distill/data/category_prompts.json` 的 `prompt_to_category`，把输出 COCO 的 `categories.name` 从推理 prompt 替换为真实中文类别名；可用 `--prompt-map` 指定其他映射文件，文件缺失或缺少该字段时保持 prompt 原样。
 
 ### 使用全部类别 + 提示词分批
 

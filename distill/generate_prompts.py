@@ -18,7 +18,9 @@
                 "models": 该类别所属的任务（模型）列表
             },
             ...
-        }
+        },
+        "prompt_to_category": {推理 prompt: 真实中文类别名} 的反向映射,
+        供 generate_pseudo_labels.py 把 COCO categories.name 还原为真实中文类别名。
     }
 
 prompt 默认取中文类别名称，可直接用于 VLX-Seek 推理；如需更精确的语义，
@@ -143,6 +145,15 @@ def build_all_prompt(categories: dict[str, dict]) -> str:
     return DETECTION_TEMPLATE.format(labels)
 
 
+def build_prompt_to_category(categories: dict[str, dict]) -> dict[str, str]:
+    """反向映射：推理 prompt -> 真实中文类别名。
+
+    供 generate_pseudo_labels.py 把 COCO categories.name 从 prompt 还原为
+    真实中文类别名使用（prompt 可能被手动改成描述性文本）。
+    """
+    return {entry["prompt"]: zh_name for zh_name, entry in categories.items()}
+
+
 def main() -> None:
     args = parse_args()
     all_cls = fetch_all_cls(args.url, args.timeout)
@@ -164,6 +175,7 @@ def main() -> None:
     result = {
         "all_prompt": build_all_prompt(categories),
         "categories": categories,
+        "prompt_to_category": build_prompt_to_category(categories),
     }
     with open(output, "w", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False, indent=2)

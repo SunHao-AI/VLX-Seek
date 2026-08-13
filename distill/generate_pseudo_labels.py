@@ -32,6 +32,12 @@
     做滑窗裁剪（默认 1000x1000，重叠 10%），对每个裁剪块分别跑 WeDetect +
     VLX-Seek，再合并回原图坐标。适合大图小目标场景。可用 --slice-width /
     --slice-height / --overlap-width-ratio / --overlap-height-ratio 调整。
+
+类别名还原说明：
+    --categories 传入的是推理 prompt（可能与真实中文类别名不同）。若
+    --prompt-map 指向的 category_prompts.json（generate_prompts.py 输出）
+    含 prompt_to_category 反向映射，输出 COCO 的 categories.name 会替换为
+    真实中文类别名；文件缺失或缺少该字段时保持 prompt 原样。
 """
 
 from __future__ import annotations
@@ -71,6 +77,12 @@ def parse_args() -> argparse.Namespace:
         help="检测类别，分号分隔，如 'person; car; dog'。同时作为 COCO categories。",
     )
     parser.add_argument("--output", default="pseudo_labels.json", help="输出 COCO JSON 路径")
+    parser.add_argument(
+        "--prompt-map",
+        default=str(Path(__file__).resolve().parent / "data" / "category_prompts.json"),
+        help="类别 prompt 映射文件（generate_prompts.py 输出）。用于把 COCO categories.name"
+        " 从推理 prompt 还原为真实中文类别名；文件不存在或缺少 prompt_to_category 时保持原样。",
+    )
     parser.add_argument("--model-path", default="resources/VLX-Seek-1.5-10B")
     parser.add_argument(
         "--detector-checkpoint",
@@ -248,6 +260,25 @@ def collect_image_paths(image_dir: str) -> list[Path]:
     return paths
 
 
+def load_prompt_to_category(prompt_map: str) -> dict[str, str]:
+    """读取 category_prompts.json 的 prompt_to_category（推理 prompt -> 真实中文名）。
+
+    文件缺失、解析失败或缺少该字段时返回空字典（categories.name 保持原样）。
+    """
+    path = Path(prompt_map)
+    if not path.is_file():
+        print(f"[warn] 未找到 prompt 映射文件 {path}，categories.name 保持 prompt 原样", file=sys.stderr)
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError) as exc:
+        print(f"[warn] 读取 prompt 映射失败: {exc}，categories.name 保持 prompt 原样", file=sys.stderr)
+        return {}
+    mapping = data.get("prompt_to_category")
+    return mapping if isinstance(mapping, dict) else {}
+
+
 def run_pipeline(args: argparse.Namespace, image_paths: list[Path] | None = None) -> None:
     """单进程单卡处理一份图像列表，写入 args.output。
 
@@ -259,10 +290,16 @@ def run_pipeline(args: argparse.Namespace, image_paths: list[Path] | None = None
 
     # label(小写) -> category_id 映射
     cat_id_map = {name.lower(): idx for idx, name in enumerate(categories)}
+    # 反向映射：推理 prompt -> 真实中文类别名，替换 COCO categories.name
+    prompt_to_category = load_prompt_to_category(args.prompt_map)
+
+    def real_category_name(prompt: str) -> str:
+        return prompt_to_category.get(prompt, prompt)
+
     coco = {
         "images": [],
         "annotations": [],
-        "categories": [{"id": idx, "name": name} for idx, name in enumerate(categories)],
+        "categories": [{"id": idx, "name": real_category_name(name)} for idx, name in enumerate(categories)],
     }
 
     # 断点续跑：读取已有输出中的 file_name
