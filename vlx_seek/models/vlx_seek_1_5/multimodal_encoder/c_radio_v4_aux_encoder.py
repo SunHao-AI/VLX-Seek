@@ -157,7 +157,16 @@ class CRadioV4AuxEncoder(AbsVisionTower):
                 extra.append(name)
             else:
                 regular.append((name, data))
-        loaded = AutoWeightsLoader(self.image_tower).load_weights(regular)
+        # regular 键形如 image_tower.radio_model.model.blocks.*（外层已去掉
+        # vision_tower_aux. 前缀）；AutoWeightsLoader(self.image_tower) 的根是
+        # RADIOModel，期望相对键 radio_model.model.blocks.*，需再去掉 image_tower. 前缀。
+        prefix = "image_tower."
+        stripped = [
+            (n[len(prefix):] if n.startswith(prefix) else n, d)
+            for n, d in regular
+        ]
+        loaded = AutoWeightsLoader(self.image_tower).load_weights(stripped)
+        # loaded 是相对 image_tower 的键，加回前缀返回给外层
         return {f"image_tower.{name}" for name in loaded} | set(extra)
 
     @property
