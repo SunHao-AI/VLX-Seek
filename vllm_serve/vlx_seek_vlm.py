@@ -31,8 +31,16 @@ from vllm.transformers_utils.configs.qwen3_5 import Qwen3_5Config as _VllmQwen3_
 from vllm.model_executor.models.qwen3_5 import (
     Qwen3_5ForCausalLM as _VllmQwen3_5ForCausalLM,
     Qwen3_5ForConditionalGeneration as _VllmQwen3_5VLM,
+    Qwen3_5ProcessingInfo,
+)
+from vllm.model_executor.models.qwen3_vl import (
+    Qwen3VLMultiModalProcessor,
+    Qwen3VLDummyInputsBuilder,
 )
 from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
+from vllm.model_executor.models.registry import MULTIMODAL_REGISTRY
+from vllm.multimodal.inputs import MultiModalFieldConfig
+from vllm.multimodal.processing import PromptReplacement
 
 # 项目视觉栈（属性名与 HF modeling 保持一致）
 from vlx_seek.models.vlx_seek_1_5.multimodal_encoder.builder import (
@@ -90,6 +98,75 @@ class VLXSeek1_5Config(_VllmQwen3_5Config):
                 setattr(self, key, value)
 
 
+# ---------------------------------------------------------------------------
+# 1b-2: 自定义 MultiModalProcessor
+# 让 <objfeat>(token 248181) 进入 is_multimodal 掩码 + 透传 images_aux/bbox_list
+# ---------------------------------------------------------------------------
+
+# <objfeat> 在 tokenizer vocab 中是单 token（248181），processor 无需展开
+_OBJFEAT_TOKEN_ID = 248181
+
+
+class VLXSeekProcessingInfo(Qwen3_5ProcessingInfo):
+    """VLX-Seek processing info: 复用 Qwen3.5，无额外配置。"""
+    pass
+
+
+class VLXSeekDummyInputsBuilder(Qwen3VLDummyInputsBuilder):
+    """VLX-Seek dummy inputs: profile run 复用 Qwen3VL（无 object features）。"""
+    pass
+
+
+class VLXSeekMultiModalProcessor(Qwen3VLMultiModalProcessor):
+    """VLX-Seek processor:
+    - 添加 ``<objfeat>`` PromptReplacement（1:1 替换为 248181，进入 is_multimodal 掩码）
+    - 从 ``mm_processor_kwargs`` 透传 ``images_aux`` / ``bbox_list`` 到 mm_kwargs
+    """
+
+    def _get_prompt_updates(self, mm_items, hf_processor_mm_kwargs, out_mm_kwargs):
+        # 基类的 image/video replacement（<|image_pad|> 展开等）
+        updates = list(super()._get_prompt_updates(
+            mm_items, hf_processor_mm_kwargs, out_mm_kwargs
+        ))
+        # <objfeat> 1:1 替换（不展开，每个 bbox 一个 token）
+        updates.append(PromptReplacement(
+            modality="image",
+            target="<objfeat>",
+            replacement=[_OBJFEAT_TOKEN_ID],
+        ))
+        return updates
+
+    def _get_mm_fields_config(self, hf_inputs, hf_processor_mm_kwargs):
+        fields = dict(super()._get_mm_fields_config(hf_inputs, hf_processor_mm_kwargs))
+        # 自定义字段：按 image modality batched 切分
+        if "images_aux" in hf_inputs:
+            fields["images_aux"] = MultiModalFieldConfig.batched("image")
+        if "bbox_list" in hf_inputs:
+            fields["bbox_list"] = MultiModalFieldConfig.batched("image")
+        return fields
+
+    def _call_hf_processor(self, prompt, mm_items, mm_processor_kwargs):
+        # 提取自定义参数（不传给 HF processor，避免报错）
+        kwargs_copy = dict(mm_processor_kwargs)
+        bbox_list = kwargs_copy.pop("bbox_list", None)
+        images_aux = kwargs_copy.pop("images_aux", None)
+
+        # 调用基类处理标准 image/video
+        result = super()._call_hf_processor(prompt, mm_items, kwargs_copy)
+
+        # 合并自定义字段到 BatchFeature
+        if bbox_list is not None:
+            result["bbox_list"] = bbox_list
+        if images_aux is not None:
+            result["images_aux"] = images_aux
+        return result
+
+
+@MULTIMODAL_REGISTRY.register_processor(
+    VLXSeekMultiModalProcessor,
+    info=VLXSeekProcessingInfo,
+    dummy_inputs=VLXSeekDummyInputsBuilder,
+)
 class VLXSeek1_5ForCausalLM(_VllmQwen3_5VLM):
     """vLLM 0.17 实现：Qwen3.5 语言主干 + VLX-Seek 视觉栈。"""
 
@@ -237,20 +314,135 @@ class VLXSeek1_5ForCausalLM(_VllmQwen3_5VLM):
         return getattr(self, "vision_tower_aux", None)
 
     # ------------------------------------------------------------------
-    # 多模态嵌入（vLLM 协议：复用基类 embed_multimodal 的 kwargs 解析，
-    # 只覆盖 _process_image_input 用我们的 Qwen3_5_VlVisionTower 编码）
+    # 多模态嵌入（vLLM 协议：覆盖 embed_multimodal 处理图像 + object features）
     # ------------------------------------------------------------------
 
+    def embed_multimodal(self, **kwargs: object) -> tuple[torch.Tensor, ...] | None:
+        """覆盖基类方法：图像编码 + object features 编码。
+
+        embeddings 顺序必须与 prompt 中占位符出现顺序一致：
+        先 <|image_pad|>(248056) × N，再 <objfeat>(248181) × M。
+        ``_merge_multimodal_embeddings`` 按此顺序合并到 is_multimodal 掩码。
+        """
+        mm_input_by_modality = self._parse_and_validate_multimodal_inputs(**kwargs)
+        if not mm_input_by_modality:
+            return None
+
+        multimodal_embeddings: list[torch.Tensor] = []
+        for modality in mm_input_by_modality:
+            multimodal_input = mm_input_by_modality[modality]
+            if modality == "image":
+                embeds = self._process_image_and_object(multimodal_input, kwargs)
+                multimodal_embeddings.extend(embeds)
+
+        return tuple(multimodal_embeddings)
+
+    def _process_image_and_object(self, image_input, kwargs) -> tuple[torch.Tensor, ...]:
+        """编码图像 + object features，返回有序 embeddings tuple。
+
+        顺序：[image_embeds..., object_embeds...]（与 prompt 中占位符顺序一致）。
+        """
+        grid_thw = image_input["image_grid_thw"]
+        assert grid_thw.ndim == 2
+
+        if image_input.get("type") == "image_embeds":
+            image_embeds = image_input["image_embeds"].type(self.visual.dtype)
+            merge_size = self.visual.visual.spatial_merge_size
+            sizes = (grid_thw.prod(-1) // merge_size // merge_size).tolist()
+            image_embeds = tuple(image_embeds.split(sizes))
+            # embeds 路径不提取 multi_level_features（object 不支持 precomputed embeds）
+            vt_multi_level_features = None
+        else:
+            pixel_values = image_input["pixel_values"].type(self.visual.dtype)
+            # get_image_features 返回 (split_embeds, vision_output)
+            image_embeds, vision_output = self.visual.get_image_features(pixel_values, grid_thw)
+            # 提取 multi_level_features（object 编码需要）
+            vt_multi_level_features = self._extract_multi_level_features(image_embeds, grid_thw)
+
+        # mm_projector（当前 identity；如改为 MLP 也兼容 2D 输入）
+        projected = [self.mm_projector(e) for e in image_embeds]
+
+        # object features 编码（如果有 bbox_list + images_aux）
+        object_embeds = self._process_object_input(kwargs, vt_multi_level_features, grid_thw)
+        if object_embeds:
+            projected.extend(object_embeds)
+
+        return tuple(projected)
+
+    def _extract_multi_level_features(self, image_embeds, grid_thw):
+        """从 get_image_features 的输出提取 multi_level_features（object 编码用）。
+
+        image_embeds: tuple of [tokens, hidden]（每张图一个）
+        grid_thw: [N, 3] tensor
+        """
+        if not isinstance(self.visual, Qwen3_5_VlVisionTower):
+            return None
+        grid_list = grid_thw.tolist()
+        if len(grid_list) == 1 and isinstance(grid_list[0], list):
+            grid_list = [grid_list]
+        multi_level_features_list = []
+        for i, embed in enumerate(image_embeds):
+            grid_single = grid_thw[i:i + 1]
+            mlv = self.visual.get_multi_level_features(embed, grid_single)
+            multi_level_features_list.append(mlv)
+        return multi_level_features_list
+
+    def _process_object_input(self, kwargs, vt_multi_level_features, grid_thw):
+        """编码 object features（bbox_list + images_aux → object embeddings）。
+
+        返回 list of [num_bbox, hidden] tensor（与 prompt 中 <objfeat> 顺序一致）。
+        """
+        images_aux = kwargs.get("images_aux")
+        bbox_list = kwargs.get("bbox_list")
+
+        if images_aux is None or bbox_list is None:
+            return None
+
+        vision_tower_aux = self.get_vision_tower_aux()
+        if vision_tower_aux is None:
+            return None
+
+        # 检查是否有有效 bbox
+        has_bbox = any(b is not None and len(b) > 0 for b in bbox_list)
+        if not has_bbox:
+            return None
+
+        if vt_multi_level_features is None:
+            return None
+
+        # 计算 vt_images_size（从 grid_thw 推断原图尺寸）
+        patch_size = self.visual.config.patch_size
+        grid_list = grid_thw.tolist()
+        if len(grid_list) == 1 and isinstance(grid_list[0], list):
+            grid_list = [grid_list]
+        image_grid_thws = [grid_thw[i:i + 1] for i in range(len(grid_thw))]
+        vt_images_size = [thw[0][-2:] * patch_size for thw in image_grid_thws]
+
+        # encode_objects 期望 images_aux 是 list of [1, C, H, W] tensor
+        if isinstance(images_aux, torch.Tensor):
+            # 单张图：tensor -> list
+            if images_aux.ndim == 3:
+                images_aux = [images_aux.unsqueeze(0)]
+            elif images_aux.ndim == 4:
+                images_aux = [images_aux[i] for i in range(len(images_aux))]
+        elif not isinstance(images_aux, list):
+            images_aux = [images_aux]
+
+        # bbox_list 期望是 list of tensor
+        if isinstance(bbox_list, torch.Tensor):
+            bbox_list = [bbox_list]
+
+        object_features = self.encode_objects(
+            images_aux, bbox_list, vt_multi_level_features, vt_images_size
+        )
+        return object_features
+
     def _process_image_input(self, image_input) -> tuple[torch.Tensor, ...]:
-        """覆盖基类方法，用 Qwen3_5_VlVisionTower 编码图像。
+        """覆盖基类方法（兼容路径，不含 object features）。
 
         基类 ``_parse_and_validate_image_input`` 把 kwargs 解析成
         ``Qwen2_5_VLImageInputs``（含 pixel_values / image_grid_thw / type），
         然后调用本方法做实际视觉编码。
-
-        ``Qwen3_5_VlVisionTower.get_image_features`` 正好接收预处理后的
-        ``pixel_values`` + ``grid_thw``，内部调用 Qwen3_5VisionModel 并按
-        image 拆分，返回 tuple of [tokens_i, hidden]。
         """
         grid_thw = image_input["image_grid_thw"]
         assert grid_thw.ndim == 2
@@ -262,10 +454,8 @@ class VLXSeek1_5ForCausalLM(_VllmQwen3_5VLM):
             image_embeds = tuple(image_embeds.split(sizes))
         else:
             pixel_values = image_input["pixel_values"].type(self.visual.dtype)
-            # get_image_features 内部调用 Qwen3_5VisionModel，返回已 split 的 tuple
             image_embeds, _ = self.visual.get_image_features(pixel_values, grid_thw)
 
-        # mm_projector（当前 identity；如改为 MLP 也兼容 2D 输入）
         return tuple(self.mm_projector(e) for e in image_embeds)
 
     # ------------------------------------------------------------------
