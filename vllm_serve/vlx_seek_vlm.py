@@ -59,6 +59,28 @@ class VLXSeek1_5Config(_VllmQwen3_5Config):
 
     model_type = "vlx_seek_1_5"
 
+    def __init__(self, **kwargs):
+        # transformers 5.x 的 from_dict 会先处理 sub_configs：把嵌套的
+        # text_config/vision_config 字典转成对象再传入 __init__；而 vLLM 的
+        # Qwen3_5Config.__init__ 只处理 dict/None 两种输入，对象会被静默丢弃，
+        # 导致属性缺失（报错：text_config does not have num_attention_heads）。
+        # 这里统一兜底：dict → 用 vLLM 的 sub_configs 解析成对象；对象 → 直接
+        # 透传；None → 沿用 vLLM 默认值；最后无论如何强制写回属性。
+        from vllm.transformers_utils.configs.qwen3_5 import (
+            Qwen3_5TextConfig,
+            Qwen3_5VisionConfig,
+        )
+
+        tc = kwargs.pop("text_config", None)
+        vc = kwargs.pop("vision_config", None)
+        if isinstance(tc, dict):
+            tc = Qwen3_5TextConfig(**tc)
+        if isinstance(vc, dict):
+            vc = Qwen3_5VisionConfig(**vc)
+        super().__init__(text_config=tc, vision_config=vc, **kwargs)
+        self.text_config = tc if tc is not None else self.text_config
+        self.vision_config = vc if vc is not None else self.vision_config
+
 
 class VLXSeek1_5ForCausalLM(_VllmQwen3_5VLM):
     """vLLM 0.17 实现：Qwen3.5 语言主干 + VLX-Seek 视觉栈。"""
