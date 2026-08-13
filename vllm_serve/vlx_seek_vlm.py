@@ -94,12 +94,12 @@ class VLXSeek1_5ForCausalLM(_VllmQwen3_5VLM):
     """vLLM 0.17 实现：Qwen3.5 语言主干 + VLX-Seek 视觉栈。"""
 
     # HF 权重键 → vLLM 参数键。HF 键形如 model.language_model.* / model.vision_tower.* / lm_head.*
-    # 注意 dict 按插入顺序遍历，长前缀必须先于其超集（"model.vision_tower.visual." 在 "model." 之前）。
+    # 注意 dict 按插入顺序遍历，长前缀必须先于其超集（"model.vision_tower." 在 "model." 之前）。
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={
-            # 视觉塔：HF model.vision_tower.visual.*（vision_tower 属性 → 项目 visual 塔内部 vit）
-            #  → vLLM self.visual.visual.*
-            "model.vision_tower.visual.": "visual.",
+            # 视觉塔：HF model.vision_tower.visual.blocks.*（vision_tower 属性 → 项目塔）
+            #  → vLLM self.visual.visual.blocks.*（只需替换第一段 vision_tower → visual）
+            "model.vision_tower.": "visual.",
             # 嵌套 language_model 需要先替换（更长前缀优先），映射到 vLLM 的 language_model.model.*
             "model.language_model.": "language_model.model.",
             # 其余视觉子模块去 model. 前缀即可（本类直接挂在这些属性上）
