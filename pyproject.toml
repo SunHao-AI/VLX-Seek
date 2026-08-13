@@ -32,6 +32,12 @@ distill = [
     "ultralytics",
 ]
 
+[tool.uv.extra-build-dependencies]
+# flash-attn 源码构建时 setup.py 需要 import torch（它未声明为构建依赖），
+# 这里向 uv 隔离构建环境注入与项目一致的 torch，避免 ModuleNotFoundError。
+# 注意：仍需要服务器上有 nvcc（CUDA toolkit），编译约 10-30 分钟。
+flash-attn = ["torch==2.10.0"]
+
 [tool.uv]
 # 固定 Python 版本，保证虚拟环境一致性
 python-preference = "only-managed"
