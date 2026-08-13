@@ -346,3 +346,91 @@ def export_labelme(images: list[Image], out_dir: str | Path, w: Warnings) -> Non
         }
         (out_dir / f"{Path(img.file_name).stem}.json").write_text(
             json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="COCO / YOLO / LabelMe 标注格式双向转换")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    def add_common_yolo(p: argparse.ArgumentParser) -> None:
+        p.add_argument("--image-dir", required=True, help="图像目录（YOLO 反归一化读尺寸/复制图片）")
+        p.add_argument("--label-dir", required=True, help="YOLO labels 目录（*.txt）")
+        p.add_argument("--names", required=True, help="类别名：names.txt（每行一个）或 data.yaml")
+
+    def add_out_dir(p: argparse.ArgumentParser) -> None:
+        p.add_argument("--out-dir", required=True, help="输出目录（自动生成 images/ labels/ names.txt dataset.yaml）")
+
+    p = sub.add_parser("coco2yolo", help="COCO JSON -> YOLO txt")
+    p.add_argument("--coco-json", required=True, help="COCO 标注 JSON")
+    p.add_argument("--image-dir", required=True, help="COCO file_name 相对此目录的图片源目录")
+    add_out_dir(p)
+    p.add_argument("--no-copy-images", action="store_true", help="不复制图片到 out/images")
+
+    p = sub.add_parser("yolo2coco", help="YOLO txt -> COCO JSON")
+    add_common_yolo(p)
+    p.add_argument("--out-json", required=True, help="输出 COCO JSON 路径")
+
+    p = sub.add_parser("coco2labelme", help="COCO JSON -> LabelMe JSON")
+    p.add_argument("--coco-json", required=True, help="COCO 标注 JSON")
+    p.add_argument("--out-dir", required=True, help="LabelMe JSON 输出目录")
+
+    p = sub.add_parser("labelme2coco", help="LabelMe JSON -> COCO JSON")
+    p.add_argument("--labelme-dir", required=True, help="LabelMe 标注目录（一图一 json）")
+    p.add_argument("--out-json", required=True, help="输出 COCO JSON 路径")
+
+    p = sub.add_parser("yolo2labelme", help="YOLO txt -> LabelMe JSON")
+    add_common_yolo(p)
+    add_out_dir(p)
+
+    p = sub.add_parser("labelme2yolo", help="LabelMe JSON -> YOLO txt")
+    p.add_argument("--labelme-dir", required=True, help="LabelMe 标注目录（一图一 json）")
+    p.add_argument("--image-dir", default=None, help="图片源目录（复制到 out/images；缺省时相对 cwd 查找）")
+    add_out_dir(p)
+    p.add_argument("--no-copy-images", action="store_true", help="不复制图片到 out/images")
+    return parser
+
+
+def main() -> None:
+    args = build_parser().parse_args()
+    w = Warnings()
+    from coco_utils import load_coco, save_coco, write_dataset_yaml
+
+    out = Path(args.out_dir) if hasattr(args, "out_dir") and args.out_dir else None
+    if out is not None:
+        out.mkdir(parents=True, exist_ok=True)
+
+    if args.cmd == "coco2yolo":
+        imgs = parse_coco(load_coco(args.coco_json), w)
+        names = export_yolo(imgs, out / "images", out / "labels",
+                            not args.no_copy_images, w, image_dir=args.image_dir)
+        save_names(names, out / "names.txt")
+        write_dataset_yaml(out, names)
+        print(f"转换完成：{len(imgs)} 张图")
+    elif args.cmd == "yolo2coco":
+        imgs = parse_yolo(args.image_dir, args.label_dir, load_names(args.names), w)
+        save_coco(export_coco(imgs, w), args.out_json)
+        print(f"转换完成：{len(imgs)} 张图")
+    elif args.cmd == "coco2labelme":
+        imgs = parse_coco(load_coco(args.coco_json), w)
+        export_labelme(imgs, args.out_dir, w)
+        print(f"转换完成：{len(imgs)} 张图")
+    elif args.cmd == "labelme2coco":
+        imgs = parse_labelme(args.labelme_dir, w)
+        save_coco(export_coco(imgs, w), args.out_json)
+        print(f"转换完成：{len(imgs)} 张图")
+    elif args.cmd == "yolo2labelme":
+        imgs = parse_yolo(args.image_dir, args.label_dir, load_names(args.names), w)
+        export_labelme(imgs, args.out_dir, w)
+        print(f"转换完成：{len(imgs)} 张图")
+    elif args.cmd == "labelme2yolo":
+        imgs = parse_labelme(args.labelme_dir, w)
+        names = export_yolo(imgs, out / "images", out / "labels",
+                            not args.no_copy_images, w, image_dir=args.image_dir)
+        save_names(names, out / "names.txt")
+        write_dataset_yaml(out, names)
+        print(f"转换完成：{len(imgs)} 张图")
+    w.report()
+
+
+if __name__ == "__main__":
+    main()
