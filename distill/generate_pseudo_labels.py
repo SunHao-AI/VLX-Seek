@@ -81,6 +81,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lang", choices=("en", "zh"), default="en")
     parser.add_argument("--max-new-tokens", type=int, default=2048)
     parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument(
+        "--min-area",
+        type=float,
+        default=0.0,
+        help="过滤面积小于该值的检测框（像素），默认 0 不过滤",
+    )
     parser.add_argument("--resume", action="store_true", help="跳过输出文件中已存在的图像")
     parser.add_argument("--start-index", type=int, default=0, help="从第几张图开始（分片用）")
     parser.add_argument("--end-index", type=int, default=None, help="处理到第几张图（不含，分片用）")
