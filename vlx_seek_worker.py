@@ -266,9 +266,10 @@ class VLXSeekWorker:
         elapsed = time.perf_counter() - start
         completion_tokens = output_ids.shape[1] - input_ids.shape[1]
         if self.log_timing:
+            tok_s = completion_tokens / elapsed if elapsed > 0 else float("inf")
             print(
                 f"[timing] prompt={input_ids.shape[1]} completion={completion_tokens} "
-                f"{elapsed:.2f}s ({completion_tokens / elapsed:.1f} tok/s)",
+                f"{elapsed:.2f}s ({tok_s:.1f} tok/s)",
                 file=sys.stderr,
             )
         completion_ids = output_ids[0, input_ids.shape[1] :]
