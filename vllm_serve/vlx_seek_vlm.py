@@ -341,7 +341,10 @@ class VLXSeek1_5ForCausalLM(_VllmQwen3_5VLM):
 
         if not all_embeds:
             return None
-        return torch.cat(all_embeds, dim=0)
+        # 返回 tuple（元素数 = mm item 数），每个元素是单个 tensor：
+        # 图像 token + object token 合并。sanity_check_mm_encoder_outputs 校验
+        # len(mm_embeddings) == expected_num_items（1 个 image item → 1 个元素）。
+        return (torch.cat(all_embeds, dim=0),)
 
     def _process_image_and_object(self, image_input, kwargs) -> tuple[torch.Tensor, ...]:
         """编码图像 + object features，返回有序 embeddings tuple。
