@@ -145,14 +145,14 @@ class VLXSeekMultiModalProcessor(Qwen3VLMultiModalProcessor):
             fields["bbox_list"] = MultiModalFieldConfig.batched("image")
         return fields
 
-    def _call_hf_processor(self, prompt, mm_items, mm_processor_kwargs):
+    def _call_hf_processor(self, prompt, mm_data, mm_kwargs, tok_kwargs):
         # 提取自定义参数（不传给 HF processor，避免报错）
-        kwargs_copy = dict(mm_processor_kwargs)
+        kwargs_copy = dict(mm_kwargs)
         bbox_list = kwargs_copy.pop("bbox_list", None)
         images_aux = kwargs_copy.pop("images_aux", None)
 
         # 调用基类处理标准 image/video
-        result = super()._call_hf_processor(prompt, mm_items, kwargs_copy)
+        result = super()._call_hf_processor(prompt, mm_data, kwargs_copy, tok_kwargs)
 
         # 合并自定义字段到 BatchFeature
         if bbox_list is not None:
