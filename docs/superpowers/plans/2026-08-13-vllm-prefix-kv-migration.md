@@ -122,7 +122,19 @@ vLLM 的 ModelConfig 校验走 transformers 架构注册表，`model_type: vlx_s
 
 **冒烟测试通过（服务器）**：detect_multi_prompt（2 批 21.25s）、detect（5.72s）、predict_batch（5.64s，批量共享前缀生效）。接口格式与 HF worker 一致。
 
-**待办（Task 3 Step 3）**：HF vs vLLM 输出一致性回归（真实图片，两环境各跑 1 张图对比检测结果）。
+**待办（Task 3 Step 3，脚本已就绪 `vllm_serve/test_consistency.py`）**：HF vs vLLM 输出一致性回归——同一张真实图片，两端各跑 1 次（`.venv` 跑 `--backend hf`、`.venv-vllm` 跑 `--backend vllm`，同图片/类别/boxes、temperature=0），对比 `--out` 两个 JSON 的 answer 与 result_bbox_list。示例：
+```bash
+# .venv（HF）
+python -m vllm_serve.test_consistency --backend hf \
+  --model-path resources/VLX-Seek-1.5-10B --image data/images/xxx.jpg \
+  --categories "人群密集; 道路施工区域或施工场景; 水面浑浊、不洁的水体; 水中游泳的人" \
+  --out results/hf.json
+# .venv-vllm（vLLM）
+python -m vllm_serve.test_consistency --backend vllm \
+  --model-path resources/VLX-Seek-1.5-10B --image data/images/xxx.jpg \
+  --categories "人群密集; 道路施工区域或施工场景; 水面浑浊、不洁的水体; 水中游泳的人" \
+  --out results/vllm.json
+```
 
 ## Task 4 待办（2026-08-13）
 
