@@ -81,13 +81,25 @@ class VLXSeek1_5Config(_VllmQwen3_5Config):
         self.text_config = tc if tc is not None else self.text_config
         self.vision_config = vc if vc is not None else self.vision_config
 
+        # vLLM 的 Qwen3_5Config 只认声明过的字段，VLX-Seek 自定义字段
+        # （mm_vision_tower / mm_vision_tower_aux / mm_object_hidden_size 等）
+        # 在超类构造时会被丢弃；这里从传入 kwargs 找回并写回 self，
+        # 否则视觉栈构建条件（getattr(config, "mm_vision_tower")）会失配。
+        for key, value in kwargs.items():
+            if not hasattr(self, key) or getattr(self, key) is None:
+                setattr(self, key, value)
+
 
 class VLXSeek1_5ForCausalLM(_VllmQwen3_5VLM):
     """vLLM 0.17 实现：Qwen3.5 语言主干 + VLX-Seek 视觉栈。"""
 
     # HF 权重键 → vLLM 参数键。HF 键形如 model.language_model.* / model.vision_tower.* / lm_head.*
+    # 注意 dict 按插入顺序遍历，长前缀必须先于其超集（"model.vision_tower.visual." 在 "model." 之前）。
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={
+            # 视觉塔：HF model.vision_tower.visual.*（vision_tower 属性 → 项目 visual 塔内部 vit）
+            #  → vLLM self.visual.visual.*
+            "model.vision_tower.visual.": "visual.",
             # 嵌套 language_model 需要先替换（更长前缀优先），映射到 vLLM 的 language_model.model.*
             "model.language_model.": "language_model.model.",
             # 其余视觉子模块去 model. 前缀即可（本类直接挂在这些属性上）
@@ -108,7 +120,8 @@ class VLXSeek1_5ForCausalLM(_VllmQwen3_5VLM):
             if getattr(config, "mm_vision_tower_aux", None) is not None:
                 self.vision_tower_aux = build_vision_tower_aux(config, delay_load=False)
 
-        if getattr(config, "mm_vision_tower", None) is not None:
+        # 与项目 builder 一致：mm_vision_tower 或 vision_tower 任一存在即构建投影器
+        if getattr(config, "mm_vision_tower", None) is not None or getattr(config, "vision_tower", None) is not None:
             self.mm_projector = build_vision_projector(config)
 
         if getattr(config, "mm_vision_tower_aux", None) is not None:
