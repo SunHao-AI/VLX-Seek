@@ -237,39 +237,36 @@ class VLXSeek1_5ForCausalLM(_VllmQwen3_5VLM):
         return getattr(self, "vision_tower_aux", None)
 
     # ------------------------------------------------------------------
-    # 多模态嵌入（vLLM 协议：embed_multimodal 返回待合并的嵌入序列）
+    # 多模态嵌入（vLLM 协议：复用基类 embed_multimodal 的 kwargs 解析，
+    # 只覆盖 _process_image_input 用我们的 Qwen3_5_VlVisionTower 编码）
     # ------------------------------------------------------------------
 
-    def embed_multimodal(self, **kwargs: object):
-        images = kwargs.get("images")
-        if images is None or len(images) == 0:
-            return None
+    def _process_image_input(self, image_input) -> tuple[torch.Tensor, ...]:
+        """覆盖基类方法，用 Qwen3_5_VlVisionTower 编码图像。
 
-        images_aux = kwargs.get("images_aux")
-        bbox_list = kwargs.get("bbox_list")
-        image_grid_thws = kwargs.get("image_grid_thws")
+        基类 ``_parse_and_validate_image_input`` 把 kwargs 解析成
+        ``Qwen2_5_VLImageInputs``（含 pixel_values / image_grid_thw / type），
+        然后调用本方法做实际视觉编码。
 
-        image_embeds, image_grid_thws, vt_multi_level_features_list = self.encode_images(images, image_grid_thws)
-        image_embeds = torch.cat(image_embeds, dim=0)
+        ``Qwen3_5_VlVisionTower.get_image_features`` 正好接收预处理后的
+        ``pixel_values`` + ``grid_thw``，内部调用 Qwen3_5VisionModel 并按
+        image 拆分，返回 tuple of [tokens_i, hidden]。
+        """
+        grid_thw = image_input["image_grid_thw"]
+        assert grid_thw.ndim == 2
 
-        has_bbox = False
-        if bbox_list is not None:
-            for bbox in bbox_list:
-                if bbox is not None and len(bbox) > 0:
-                    has_bbox = True
-                    break
+        if image_input.get("type") == "image_embeds":
+            image_embeds = image_input["image_embeds"].type(self.visual.dtype)
+            merge_size = self.visual.visual.spatial_merge_size
+            sizes = (grid_thw.prod(-1) // merge_size // merge_size).tolist()
+            image_embeds = tuple(image_embeds.split(sizes))
+        else:
+            pixel_values = image_input["pixel_values"].type(self.visual.dtype)
+            # get_image_features 内部调用 Qwen3_5VisionModel，返回已 split 的 tuple
+            image_embeds, _ = self.visual.get_image_features(pixel_values, grid_thw)
 
-        object_features = []
-        if images_aux is not None and self.get_vision_tower_aux() is not None and has_bbox:
-            patch_size = self.get_vision_tower().config.patch_size
-            vt_images_size_minibatch = [g[0][-2:] * patch_size for g in image_grid_thws]
-            tmp_images_aux = [images_aux[i].unsqueeze(0) for i in range(len(images_aux))]
-            object_features = self.encode_objects(tmp_images_aux, bbox_list, vt_multi_level_features_list, vt_images_size_minibatch)
-
-        if object_features:
-            # 顺序与占位符一致：图像 token 在前，object token 在后
-            return (image_embeds, torch.cat(object_features, dim=0))
-        return image_embeds
+        # mm_projector（当前 identity；如改为 MLP 也兼容 2D 输入）
+        return tuple(self.mm_projector(e) for e in image_embeds)
 
     # ------------------------------------------------------------------
     # 权重加载
