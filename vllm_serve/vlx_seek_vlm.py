@@ -276,7 +276,16 @@ class VLXSeek1_5ForCausalLM(_VllmQwen3_5VLM):
     # ------------------------------------------------------------------
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> Set[str]:
-        loader = AutoWeightsLoader(self)
+        loader = AutoWeightsLoader(
+            self,
+            ignore_unexpected_prefixes=[
+                # input_conditioner 的 norm_mean/norm_std 与 radio_model.summary_idxs
+                # 是 buffer（非 nn.Parameter），AutoWeightsLoader 不识别普通 buffer，
+                # 由 CRadioV4AuxEncoder.load_weights 单独加载，这里忽略递归下钻。
+                "vision_tower_aux.image_tower.radio_model.input_conditioner.",
+                "vision_tower_aux.image_tower.radio_model.summary_idxs",
+            ],
+        )
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
 

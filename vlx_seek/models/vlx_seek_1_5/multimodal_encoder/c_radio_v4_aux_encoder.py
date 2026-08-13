@@ -134,6 +134,32 @@ class CRadioV4AuxEncoder(AbsVisionTower):
         else:
             return self._forward_single(images)
 
+    def load_weights(self, weights):
+        """vLLM 专用权重加载。
+
+        C-RADIO 的 ``input_conditioner.norm_mean/norm_std`` 与
+        ``radio_model.summary_idxs`` 是 nn.Buffer 而非 nn.Parameter，
+        AutoWeightsLoader 默认把它们当作缺失参数报错。这里把 buffer 键
+        分离出来手动 ``copy_``，其余参数交给 AutoWeightsLoader 递归加载。
+
+        返回相对本模块的已加载键名集合（供外层递归统计）。
+        """
+        from vllm.model_executor.models.utils import AutoWeightsLoader
+
+        weights = list(weights)
+        buffer_keys = {name for name, _ in self.named_buffers()}
+        regular = []
+        extra = []
+        for name, data in weights:
+            if name in buffer_keys:
+                buf = self.get_buffer(name)
+                buf.copy_(data.to(buf.device))
+                extra.append(name)
+            else:
+                regular.append((name, data))
+        loaded = AutoWeightsLoader(self.image_tower).load_weights(regular)
+        return {f"image_tower.{name}" for name in loaded} | set(extra)
+
     @property
     def dtype(self):
         for p in self.image_tower.radio_model.model.parameters():
