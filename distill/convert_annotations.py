@@ -132,3 +132,133 @@ def export_coco(images: list[Image], w: Warnings) -> dict[str, Any]:
             coco_anns.append(ann)
             ann_id += 1
     return {"categories": cats, "images": coco_images, "annotations": coco_anns}
+
+
+def load_names(names_path: str | Path) -> list[str]:
+    """读取类别名：names.txt（每行一个，行号=class_id）或 data.yaml（names 映射）。"""
+    text = Path(names_path).read_text(encoding="utf-8").strip()
+    if not text:
+        return []
+    if text.lstrip().startswith("names:") or "path:" in text.splitlines()[0]:
+        names: list[str] = []
+        for line in text.splitlines()[1:]:
+            line = line.strip()
+            if not line or ":" not in line:
+                continue
+            _, _, val = line.partition(":")
+            names.append(val.strip().strip("\"'"))
+        return names
+    return [ln.strip() for ln in text.splitlines() if ln.strip()]
+
+
+def save_names(names: list[str], path: str | Path) -> None:
+    Path(path).write_text("\n".join(names) + "\n", encoding="utf-8")
+
+
+def _image_size(image_dir: Path, file_name: str, w: Warnings) -> tuple[int, int] | None:
+    src = image_dir / file_name
+    if not src.is_file():
+        w.warn(f"缺图 {file_name}，跳过该图")
+        return None
+    try:
+        from PIL import Image as PILImage
+        with PILImage.open(src) as im:
+            return im.width, im.height
+    except Exception as e:
+        w.warn(f"读取图片尺寸失败 {file_name}: {e}")
+        return None
+
+
+def parse_yolo(image_dir: str | Path, label_dir: str | Path, names: list[str],
+               w: Warnings) -> list[Image]:
+    """YOLO labels 目录 -> list[Image]。每行检测 txt(5 列) 或 seg txt(>5 列)。"""
+    image_dir, label_dir = Path(image_dir), Path(label_dir)
+    images: list[Image] = []
+    for label_path in sorted(label_dir.glob("*.txt")):
+        stem = label_path.stem
+        img_file = None
+        for ext in (".jpg", ".jpeg", ".png", ".bmp"):
+            cand = image_dir / f"{stem}{ext}"
+            if cand.is_file():
+                img_file = cand.name
+                break
+        if img_file is None:
+            size = _image_size(image_dir, f"{stem}.jpg", w)
+            if size is None:
+                continue
+            img_file = f"{stem}.jpg"
+            width, height = size
+        else:
+            size = _image_size(image_dir, img_file, w)
+            if size is None:
+                continue
+            width, height = size
+        objs: list[Object] = []
+        for ln in label_path.read_text(encoding="utf-8").splitlines():
+            parts = ln.split()
+            if len(parts) < 5:
+                w.warn(f"{label_path.name}: 非法行，跳过：{ln}")
+                continue
+            cls = int(float(parts[0]))
+            if cls >= len(names):
+                w.warn(f"{label_path.name}: class_id {cls} 超出 names 范围，跳过")
+                continue
+            if len(parts) == 5:
+                cx, cy, nw, nh = (float(v) for v in parts[1:])
+                x = (cx - nw / 2) * width
+                y = (cy - nh / 2) * height
+                objs.append(Object(category_name=names[cls], category_id=cls,
+                                   bbox_xywh=[x, y, nw * width, nh * height]))
+            else:
+                if (len(parts) - 1) % 2 != 0:
+                    w.warn(f"{label_path.name}: seg 行坐标数非法，跳过：{ln}")
+                    continue
+                vals = [float(v) for v in parts[1:]]
+                points = [[vals[i] * width, vals[i + 1] * height]
+                          for i in range(0, len(vals), 2)]
+                objs.append(Object(category_name=names[cls], category_id=cls,
+                                   polygon=points))
+        images.append(Image(id=len(images), file_name=img_file,
+                            width=width, height=height, objects=objs))
+    return images
+
+
+def export_yolo(images: list[Image], out_images_dir: str | Path,
+                out_labels_dir: str | Path, copy_images: bool,
+                w: Warnings, image_dir: str | Path | None = None) -> list[str]:
+    """list[Image] -> YOLO labels txt +（可选）复制图片。返回类别名列表（顺序=class_id）。"""
+    out_images_dir, out_labels_dir = Path(out_images_dir), Path(out_labels_dir)
+    out_images_dir.mkdir(parents=True, exist_ok=True)
+    out_labels_dir.mkdir(parents=True, exist_ok=True)
+    src_root = Path(image_dir) if image_dir else None
+
+    names: list[str] = []
+    name_to_idx: dict[str, int] = {}
+    for img in images:
+        for obj in img.objects:
+            if obj.category_name not in name_to_idx:
+                name_to_idx[obj.category_name] = len(names)
+                names.append(obj.category_name)
+
+    for img in images:
+        src = (src_root / img.file_name) if src_root else Path(img.file_name)
+        if copy_images and src.is_file():
+            import shutil
+            shutil.copy2(src, out_images_dir / src.name)
+        lines: list[str] = []
+        for obj in img.objects:
+            idx = name_to_idx[obj.category_name]
+            if obj.bbox_xywh:
+                x, y, bw, bh = obj.bbox_xywh
+                cx = _clamp((x + bw / 2) / img.width, 0.0, 1.0)
+                cy = _clamp((y + bh / 2) / img.height, 0.0, 1.0)
+                nw = _clamp(bw / img.width, 0.0, 1.0)
+                nh = _clamp(bh / img.height, 0.0, 1.0)
+                lines.append(f"{idx} {cx:.6f} {cy:.6f} {nw:.6f} {nh:.6f}")
+            elif obj.polygon:
+                flat = [f"{_clamp(c / img.width if i % 2 == 0 else c / img.height, 0.0, 1.0):.6f}"
+                        for i, c in enumerate(c for p in obj.polygon for c in p)]
+                lines.append(f"{idx} " + " ".join(flat))
+        (out_labels_dir / f"{Path(img.file_name).stem}.txt").write_text(
+            "\n".join(lines), encoding="utf-8")
+    return names
