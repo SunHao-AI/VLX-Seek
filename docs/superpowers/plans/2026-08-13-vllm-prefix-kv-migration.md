@@ -75,6 +75,11 @@ vLLM 的 ModelConfig 校验走 transformers 架构注册表，`model_type: vlx_s
 
 **1a 实测发现（2026-08-13）**：vllm 环境 transformers 4.57.6 **无 `transformers.models.qwen3_5`**（qwen3_5 modeling 属 transformers 5.x）→ 项目视觉塔（依赖 `Qwen3_5VisionModel`）无法导入。修复：vllm 环境升级 transformers==5.13.0（与项目一致），vLLM 0.17 对 transformers 5.x 的兼容性待实测（若 `import vllm` 崩则回退 4.57.6 并在 vllm_serve 内自实现视觉塔）。
 
+**1a 调试记录（服务器 + 代码修复）**：
+1. `VLXSeek1_5Config` 必须继承 **vLLM 自己的** `Qwen3_5Config`（`vllm.transformers_utils.configs.qwen3_5`），否则处理器 isinstance 校验失败；
+2. transformers 5.13 的 `PretrainedConfig` 改为 dataclass 机制，`from_dict` 会先把嵌套 `text_config`/`vision_config` 转成对象传入 `__init__`，而 vLLM 的 `Qwen3_5Config.__init__` 只处理 dict/None → 对象被静默丢弃 → 需在 `VLXSeek1_5Config.__init__` 兜底解析并强制写回属性（已修复）；
+3. vLLM 为 Qwen3.5 VLM 初始化 mm budget 时会加载 **video 处理器**（VLX-Seek 纯图像模型用不到）：checkpoint 需补 `video_preprocessor_config.json`，且 **`video_processor_type` 的值必须是处理器类名 `"Qwen3VLVideoProcessor"`（不是 model_type "qwen3_5"）**，否则 `video_processor_class_from_name` 解析失败直接报 Unrecognized。
+
 ## 关键架构决策
 
 1. **自定义多模态模型注册（本计划最大工程点）**：vLLM 不识别 OmChat 式自定义 VLM。需要：
