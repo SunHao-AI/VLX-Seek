@@ -99,6 +99,21 @@ vLLM 的 ModelConfig 校验走 transformers 架构注册表，`model_type: vlx_s
 
 **1b-2 实测（服务器）**：`test_object_features.py`（纯红图 + 2 bbox + `<objfeat>` 占位符）→ 输出 `'一个红色的背景'`，22.3s（含 11s rendering）。**1a/1b 里程碑全部达成**。commit 历史：`6584440`→`94aa62a`→`fcd325c`→`3637a83`→`f507c81`→`fb99313`→`e7978de`→`25c51b5`→`f8def74`→`39851ca`→`3b5c34f`→`4e9c2b9`
 
+## Task 2 实测结论（2026-08-13，bench_prefix_cache.py）
+
+14 个共享前缀请求（同图 + 同 bbox + 不同类别后缀）批量提交：
+
+| 配置 | 总耗时 | 吞吐 |
+|---|---|---|
+| APC OFF | **24.3s** | 227 tok/s |
+| APC ON | **24.6s** | 223 tok/s |
+
+**核心结论：连续批处理（continuous batching）已覆盖共享前缀问题，无需 APC。** 同批提交时 scheduler 层直接共享 common prefix（`num_common_prefix_blocks`），第一个请求 prefill 后其余复用；APC 只对跨 batch 有价值。且 APC ON 触发 Mamba `align` 模式实验性警告（hybrid 架构支持不成熟）→ **统一保持 APC OFF，靠批量提交获得收益**。
+
+**收益实测**：14 个共享前缀请求 24.3s vs 串行 ~280s+，**~11× 加速**；输出与单请求一致（`'一个红色的背景'` 等）。
+
+## Task 3/4 待办（2026-08-13）
+
 ## 关键架构决策
 
 1. **自定义多模态模型注册（本计划最大工程点）**：vLLM 不识别 OmChat 式自定义 VLM。需要：

@@ -90,6 +90,13 @@ def parse_args() -> argparse.Namespace:
         help="WeDetect 候选区域检测器权重。默认优先在 --model-path 目录下查找" " wedetect_base_uni.pth，其次用 resources/wedetect_base_uni.pth；" "仍缺失时自动从 Hugging Face 下载。",
     )
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--backend",
+        choices=("hf", "vllm"),
+        default="hf",
+        help="推理后端：hf=HF 原始路径（默认，行为零变化）；vllm=vLLM 引擎"
+        "（需在 .venv-vllm 环境运行，批量共享前缀 KV 加速）。",
+    )
     parser.add_argument("--lang", choices=("en", "zh"), default="en")
     parser.add_argument("--max-new-tokens", type=int, default=1024)
     parser.add_argument("--temperature", type=float, default=0.0)
@@ -333,9 +340,20 @@ def run_pipeline(args: argparse.Namespace, image_paths: list[Path] | None = None
         image_paths = collect_image_paths(args.image_dir)
         image_paths = image_paths[args.start_index : args.end_index]
 
-    from vlx_seek_worker import VLXSeekWorker
+    if args.backend == "vllm":
+        from vllm_serve.vlx_seek_vllm_worker import VLXSeekVLLMWorker
 
-    worker = VLXSeekWorker(args.model_path, device=args.device)
+        worker = VLXSeekVLLMWorker(
+            args.model_path,
+            device=args.device,
+            gpu_memory_utilization=0.7,
+            tensor_parallel_size=1,
+            max_model_len=8192,
+        )
+    else:
+        from vlx_seek_worker import VLXSeekWorker
+
+        worker = VLXSeekWorker(args.model_path, device=args.device)
 
     worker.log_timing = args.log_timing
 
