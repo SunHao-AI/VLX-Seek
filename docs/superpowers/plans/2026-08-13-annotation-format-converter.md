@@ -236,7 +236,7 @@ git commit -m "feat: COCO 解析与导出"
   - `def load_names(names_path: str | Path) -> list[str]`（names.txt 每行一个 或 data.yaml 的 names 映射）
   - `def save_names(names: list[str], path: str | Path) -> None`
   - `def parse_yolo(image_dir: str | Path, label_dir: str | Path, names: list[str], w: Warnings) -> list[Image]`
-  - `def export_yolo(images: list[Image], out_images_dir: str | Path, out_labels_dir: str | Path, copy_images: bool, w: Warnings) -> list[str]`（返回类别名列表，顺序=class_id）
+  - `def export_yolo(images: list[Image], out_images_dir: str | Path, out_labels_dir: str | Path, copy_images: bool, w: Warnings, image_dir: str | Path | None = None) -> list[str]`（返回类别名列表，顺序=class_id）
 
 **规则：**
 - YOLO 检测 txt（5 列）→ `Object.bbox_xywh`；seg txt（>5 列，列数-1 为偶数）→ `Object.polygon`。
@@ -244,6 +244,7 @@ git commit -m "feat: COCO 解析与导出"
 - 解析需图片尺寸：从 `image_dir` 用 `PIL.Image.open` 读取；图片缺失或读取失败 → 跳过该图并告警。
 - 导出：类别 id 沿用 `Object.category_id`（若连续从 0 起始）否则按首次出现分配；class_id 越界/坐标超 [0,1] 均 clamp；归一化保留 6 位小数。
 - 无标注的图片也写出空 txt。
+- `copy_images` 为真时，源图片路径：`image_dir` 提供则 `image_dir / file_name`，否则 `file_name`（相对 cwd）。
 
 - [ ] **Step 1: 追加 YOLO 相关函数**
 
@@ -339,11 +340,12 @@ def parse_yolo(image_dir: str | Path, label_dir: str | Path, names: list[str],
 
 def export_yolo(images: list[Image], out_images_dir: str | Path,
                 out_labels_dir: str | Path, copy_images: bool,
-                w: Warnings) -> list[str]:
+                w: Warnings, image_dir: str | Path | None = None) -> list[str]:
     """list[Image] -> YOLO labels txt +（可选）复制图片。返回类别名列表（顺序=class_id）。"""
     out_images_dir, out_labels_dir = Path(out_images_dir), Path(out_labels_dir)
     out_images_dir.mkdir(parents=True, exist_ok=True)
     out_labels_dir.mkdir(parents=True, exist_ok=True)
+    src_root = Path(image_dir) if image_dir else None
 
     names: list[str] = []
     name_to_idx: dict[str, int] = {}
@@ -354,7 +356,7 @@ def export_yolo(images: list[Image], out_images_dir: str | Path,
                 names.append(obj.category_name)
 
     for img in images:
-        src = Path(img.file_name)
+        src = (src_root / img.file_name) if src_root else Path(img.file_name)
         if copy_images and src.is_file():
             import shutil
             shutil.copy2(src, out_images_dir / src.name)
@@ -523,16 +525,17 @@ git commit -m "feat: LabelMe 解析与导出"
 | `coco2labelme` | `--coco-json`(必填), `--out-dir`(必填) |
 | `labelme2coco` | `--labelme-dir`(必填), `--out-json`(必填) |
 | `yolo2labelme` | `--image-dir`(必填), `--label-dir`(必填), `--names`(必填), `--out-dir`(必填) |
-| `labelme2yolo` | `--labelme-dir`(必填), `--out-dir`(必填), `--no-copy-images` |
+| `labelme2yolo` | `--labelme-dir`(必填), `--out-dir`(必填), `--image-dir`(可选), `--no-copy-images` |
 
 **CLI 逻辑：**
-- `coco2yolo`：`load_coco` → `parse_coco` → `export_yolo(out/images, out/labels)` → `save_names` + `write_dataset_yaml(out, names)`。
+- `coco2yolo`：`load_coco` → `parse_coco` → `export_yolo(out/images, out/labels, copy, w, image_dir=args.image_dir)` → `save_names` + `write_dataset_yaml(out, names)`。
 - `yolo2coco`：`load_names` → `parse_yolo` → `export_coco` → `save_coco`。
 - `coco2labelme`：`load_coco` → `parse_coco` → `export_labelme`。
 - `labelme2coco`：`parse_labelme` → `export_coco` → `save_coco`。
 - `yolo2labelme`：`load_names` → `parse_yolo` → `export_labelme`。
-- `labelme2yolo`：`parse_labelme` → `export_yolo(out/images, out/labels)` → `save_names` + `write_dataset_yaml(out, names)`。
+- `labelme2yolo`：`parse_labelme` → `export_yolo(out/images, out/labels, copy, w, image_dir=args.image_dir)` → `save_names` + `write_dataset_yaml(out, names)`。
 - 每个子命令结束打印 `转换完成：N 张图` 并调用 `w.report()`。
+- `--no-copy-images` 缺省为复制图片；`labelme2yolo` 未传 `--image-dir` 时图片源为相对 cwd 的 file_name。
 
 - [ ] **Step 1: 追加 CLI 实现**
 
@@ -573,6 +576,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("labelme2yolo", help="LabelMe JSON -> YOLO txt")
     p.add_argument("--labelme-dir", required=True, help="LabelMe 标注目录（一图一 json）")
+    p.add_argument("--image-dir", default=None, help="图片源目录（复制到 out/images；缺省时相对 cwd 查找）")
     add_out_dir(p)
     p.add_argument("--no-copy-images", action="store_true", help="不复制图片到 out/images")
     return parser
@@ -588,11 +592,12 @@ def main() -> None:
         out.mkdir(parents=True, exist_ok=True)
 
     if args.cmd == "coco2yolo":
-        names = export_yolo(parse_coco(load_coco(args.coco_json), w),
-                            out / "images", out / "labels", not args.no_copy_images, w)
+        imgs = parse_coco(load_coco(args.coco_json), w)
+        names = export_yolo(imgs, out / "images", out / "labels",
+                            not args.no_copy_images, w, image_dir=args.image_dir)
         save_names(names, out / "names.txt")
         write_dataset_yaml(out, names)
-        print(f"转换完成：{len(images)} 张图")  # noqa: F821
+        print(f"转换完成：{len(imgs)} 张图")
     elif args.cmd == "yolo2coco":
         imgs = parse_yolo(args.image_dir, args.label_dir, load_names(args.names), w)
         save_coco(export_coco(imgs, w), args.out_json)
@@ -611,7 +616,8 @@ def main() -> None:
         print(f"转换完成：{len(imgs)} 张图")
     elif args.cmd == "labelme2yolo":
         imgs = parse_labelme(args.labelme_dir, w)
-        names = export_yolo(imgs, out / "images", out / "labels", not args.no_copy_images, w)
+        names = export_yolo(imgs, out / "images", out / "labels",
+                            not args.no_copy_images, w, image_dir=args.image_dir)
         save_names(names, out / "names.txt")
         write_dataset_yaml(out, names)
         print(f"转换完成：{len(imgs)} 张图")
@@ -620,17 +626,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-```
-
-> 注意：`coco2yolo` 分支中先保存 `imgs` 再打印，避免引用未定义变量：
-
-```python
-    if args.cmd == "coco2yolo":
-        imgs = parse_coco(load_coco(args.coco_json), w)
-        names = export_yolo(imgs, out / "images", out / "labels", not args.no_copy_images, w)
-        save_names(names, out / "names.txt")
-        write_dataset_yaml(out, names)
-        print(f"转换完成：{len(imgs)} 张图")
 ```
 
 - [ ] **Step 2: 端到端验证（examples 往返 + shard 冒烟）**
