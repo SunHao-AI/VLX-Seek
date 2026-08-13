@@ -271,3 +271,78 @@ def export_yolo(images: list[Image], out_images_dir: str | Path,
         (out_labels_dir / f"{Path(img.file_name).stem}.txt").write_text(
             "\n".join(lines), encoding="utf-8")
     return names
+
+
+def parse_labelme(labelme_dir: str | Path, w: Warnings) -> list[Image]:
+    """LabelMe 标注目录（一图一 json）-> list[Image]。"""
+    labelme_dir = Path(labelme_dir)
+    images: list[Image] = []
+    for json_path in sorted(labelme_dir.glob("*.json")):
+        data = json.loads(json_path.read_text(encoding="utf-8"))
+        objs: list[Object] = []
+        for shape in data.get("shapes", []):
+            label = shape.get("label", "")
+            stype = shape.get("shape_type", "")
+            points = [[float(p[0]), float(p[1])] for p in shape.get("points", [])]
+            if stype == "rectangle":
+                if len(points) != 2:
+                    w.warn(f"{json_path.name}: rectangle 需要 2 点，跳过")
+                    continue
+                (x1, y1), (x2, y2) = points
+                x, y = min(x1, x2), min(y1, y2)
+                bw, bh = abs(x2 - x1), abs(y2 - y1)
+                if bw <= 0 or bh <= 0:
+                    w.warn(f"{json_path.name}: 非法 rectangle，跳过")
+                    continue
+                objs.append(Object(category_name=label, bbox_xywh=[x, y, bw, bh]))
+            elif stype == "polygon":
+                if len(points) < 3:
+                    w.warn(f"{json_path.name}: polygon 至少 3 点，跳过")
+                    continue
+                objs.append(Object(category_name=label, polygon=points))
+            else:
+                w.warn(f"{json_path.name}: 未知 shape_type={stype}，跳过")
+        if not objs:
+            w.warn(f"{json_path.name}: 无有效标注，跳过该图")
+            continue
+        images.append(Image(id=len(images),
+                            file_name=data.get("imagePath", json_path.stem),
+                            width=int(data.get("imageWidth", 0)),
+                            height=int(data.get("imageHeight", 0)),
+                            objects=objs))
+    return images
+
+
+def export_labelme(images: list[Image], out_dir: str | Path, w: Warnings) -> None:
+    """list[Image] -> LabelMe JSON（每图一个，imageData 留空）。"""
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for img in images:
+        shapes = []
+        for obj in img.objects:
+            shape: dict[str, Any] = {"label": obj.category_name,
+                                     "group_id": None, "flags": {}}
+            if obj.bbox_xywh:
+                x, y, bw, bh = obj.bbox_xywh
+                shape["shape_type"] = "rectangle"
+                shape["points"] = bbox_to_rectangle(x, y, bw, bh)
+            elif obj.polygon:
+                shape["shape_type"] = "polygon"
+                shape["points"] = [[round(c, 2) for c in p] for p in obj.polygon]
+            else:
+                continue
+            shapes.append(shape)
+        if not shapes:
+            w.warn(f"{img.file_name}: 无标注可导出，跳过")
+            continue
+        data = {
+            "version": "5.5.0",
+            "flags": {},
+            "shapes": shapes,
+            "imagePath": img.file_name,
+            "imageData": "",
+            "imageWidth": img.width,
+            "imageHeight": img.height,
+        }
+        (out_dir / f"{Path(img.file_name).stem}.json").write_text(
+            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
