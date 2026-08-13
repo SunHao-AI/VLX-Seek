@@ -81,13 +81,28 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=0, help="多批类别每批个数，<=0 全部一批")
     parser.add_argument("--lang", choices=("en", "zh"), default="zh")
     parser.add_argument("--max-new-tokens", type=int, default=256)
+    parser.add_argument(
+        "--max-side",
+        type=int,
+        default=1024,
+        help="等比缩图到最长边不超过该值（默认 1024，模拟 distill 的 crop 视觉规模；"
+        "整张大图直出会因视觉 token 超 max_model_len 失败）。0=不缩放。",
+    )
     parser.add_argument("--out", required=True, help="输出 JSON 路径")
     args = parser.parse_args()
 
     image = Image.open(args.image).convert("RGB")
+    original_size = list(image.size)
+    if args.max_side > 0 and max(image.size) > args.max_side:
+        image.thumbnail((args.max_side, args.max_side))
+    resized_size = list(image.size)
+    if original_size != resized_size:
+        print(f"[resize] {original_size} -> {resized_size}")
     boxes = parse_boxes(args.boxes)
     categories = [c.strip() for c in args.categories.split(";") if c.strip()]
 
+    if args.backend == "hf":
+        print("[env] HF 后端请使用项目原始环境（勿在 .venv-vllm 中跑，缺 accelerate）")
     worker = build_worker(args.backend, args.model_path)
     worker.log_timing = True
 
@@ -111,6 +126,8 @@ def main() -> None:
     result = {
         "backend": args.backend,
         "image": args.image,
+        "original_size": original_size,
+        "resized_size": resized_size,
         "categories": categories,
         "boxes": boxes,
         "lang": args.lang,
