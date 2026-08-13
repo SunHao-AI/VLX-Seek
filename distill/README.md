@@ -10,6 +10,7 @@ distill/
 ├── download_images.py          # 步骤2：按 URL 列表并发下载图片
 ├── generate_prompts.py         # 步骤3：从检测服务生成 VLX-Seek 类别 prompt
 ├── generate_pseudo_labels.py   # 步骤4：VLX-Seek → COCO 伪标签
+├── convert_annotations.py      # 标注格式互转：COCO / YOLO / LabelMe（6 个方向）
 ├── finetune_yolo_world.py      # 步骤5：COCO → 官方 YOLO-World 微调
 ├── coco_utils.py               # 共享 COCO 工具（坐标转换/划分/转 YOLO txt）
 └── examples/                   # 端到端示例数据
@@ -123,6 +124,99 @@ python distill/generate_pseudo_labels.py \
 - 图像按轮询方式均分到各 GPU；各卡结果写入 `<output>.shard<i>.json`，全部完成后合并为最终输出（分片文件保留，可配合 `--resume` 断点续跑）。
 - 多卡模式与 `--prompt-batch-size` 兼容：每个子进程内部同样走分批 + 图片编码复用逻辑。
 - 注意显存：每个进程需加载完整 VLX-Seek 模型（10B）+ WeDetect，N 个进程同时驻留需约 N × 20GB+ 显存。
+
+## 标注格式转换（convert_annotations.py）
+
+步骤4 输出的伪标签是 COCO 格式；微调前可能需要在 COCO / YOLO / LabelMe 之间互转（如转换后交给标注平台人工修正、或导出 YOLO txt 直接训练）。本脚本以统一中间表示实现 6 个转换方向：
+
+```
+COCO   ⇄  YOLO（检测/分割 txt）
+COCO   ⇄  LabelMe
+YOLO   ⇄  LabelMe
+```
+
+```bash
+python distill/convert_annotations.py <子命令> [参数]
+python distill/convert_annotations.py --help        # 查看全部子命令
+python distill/convert_annotations.py <子命令> --help   # 查看子命令参数
+```
+
+依赖仅标准库 + PIL（图片尺寸读取），无需额外安装。
+
+### COCO → YOLO
+
+```bash
+python distill/convert_annotations.py coco2yolo \
+  --coco-json distill/data/pseudo_labels.json \
+  --image-dir distill/data/images \
+  --out-dir distill/data/yolo
+```
+
+- `--image-dir`：COCO `file_name` 相对此目录的图片源目录，用于复制图片与读取尺寸。
+- 输出目录结构（ultralytics 兼容）：
+
+```
+<out-dir>/
+├── images/          # 复制的图片（加 --no-copy-images 则不复制）
+├── labels/          # 每图一个 txt：class_id cx cy w h（检测）或 + 多边形点（分割，归一化 6 位小数）
+├── names.txt        # 每行一个类别名，顺序即 class_id
+└── dataset.yaml     # 可直接用于 YOLO 训练
+```
+
+### YOLO → COCO
+
+```bash
+python distill/convert_annotations.py yolo2coco \
+  --image-dir distill/data/yolo/images \
+  --label-dir distill/data/yolo/labels \
+  --names distill/data/yolo/names.txt \
+  --out-json distill/data/pseudo_labels_coco.json
+```
+
+### COCO → LabelMe
+
+```bash
+python distill/convert_annotations.py coco2labelme \
+  --coco-json distill/data/pseudo_labels.json \
+  --out-dir distill/data/labelme
+```
+
+- 每张图输出一个同名 `.json`（bbox 转为 `rectangle`，segmentation 转为 `polygon`），`imageData` 为空字符串，可配合 `labelme` 工具人工修正。
+
+### LabelMe → COCO
+
+```bash
+python distill/convert_annotations.py labelme2coco \
+  --labelme-dir distill/data/labelme \
+  --out-json distill/data/pseudo_labels_coco.json
+```
+
+### YOLO → LabelMe
+
+```bash
+python distill/convert_annotations.py yolo2labelme \
+  --image-dir distill/data/yolo/images \
+  --label-dir distill/data/yolo/labels \
+  --names distill/data/yolo/names.txt \
+  --out-dir distill/data/labelme
+```
+
+### LabelMe → YOLO
+
+```bash
+python distill/convert_annotations.py labelme2yolo \
+  --labelme-dir distill/data/labelme \
+  --image-dir distill/data/images \
+  --out-dir distill/data/yolo
+```
+
+- `--image-dir` 缺省时相对当前目录查找图片；加 `--no-copy-images` 则不复制图片到 `out/images`。
+
+### 通用说明
+
+- **`--names` 支持两种格式**：`names.txt`（每行一个类别名）或 `data.yaml`（含 `names:` 键，兼容多行列表与内联 `{0: name, 1: name}` 写法）。
+- **类别顺序**：转出方向（→ YOLO / → LabelMe）按类别首次出现顺序自动分配 class_id，并写出 `names.txt` 固化顺序；转回方向需用同一份 `names.txt` 保证 id 一致。
+- **边界数据自动跳过并告警**（不中断转换）：非法/越界 bbox、RLE 分割、空标注文件、缺 `imageWidth`/`imageHeight` 的 LabelMe、无对应图片的标注等。运行结束后汇总输出警告条数，可据此检查源数据。
 
 ## 步骤5：微调 YOLO-World
 
