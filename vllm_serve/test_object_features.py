@@ -33,31 +33,31 @@ def main() -> None:
         max_model_len=8192,
     )
 
-    # 2. 获取 aux image processor（从模型实例）
-    # vLLM 的模型实例在 worker 进程中，主进程无法直接访问。
-    # 这里用 C-RADIOv4 的 image processor 配置手动加载。
-    # 简化方案：用主 image processor 预处理作为 images_aux（仅测试流程）
-    from transformers import AutoImageProcessor
+    # 2. aux image processor = CLIPImageProcessor（C-RADIOv4 硬编码配置）
+    from transformers import CLIPImageProcessor
 
-    # VLX-Seek 的主 image processor 配置
-    primary_processor = AutoImageProcessor.from_pretrained(
-        model_path, trust_remote_code=True
+    aux_processor = CLIPImageProcessor(
+        do_resize=False,
+        do_center_crop=False,
+        do_rescale=True,
+        do_normalize=False,
+        do_convert_rgb=True,
+        resample=3,
     )
 
-    # 3. 构建测试数据
-    # 用纯红色 448x448 图片 + 2 个 bbox
+    # 3. 构建测试数据：纯红色 448x448 图片 + 2 个 bbox
     img = Image.new("RGB", (448, 448), "red")
 
-    # 预处理主图像（vLLM processor 会自动处理）
-    # bbox_list: [[x1,y1,x2,y2], ...]（像素坐标）
-    bbox_list = torch.tensor([[50, 50, 200, 200], [200, 200, 400, 400]], dtype=torch.float32)
+    # bbox_list: [num_images, num_bbox, 4]（带 batch 维，与字段配置 batched 对齐）
+    bbox_list = torch.tensor(
+        [[[50, 50, 200, 200], [200, 200, 400, 400]]], dtype=torch.float32
+    )
 
-    # images_aux: 用主 image processor 预处理（简化方案，正式应使用 aux processor）
-    aux_data = primary_processor.preprocess(img, return_tensors="pt")
+    # images_aux: CLIPImageProcessor 输出 [1, C, H, W]（带 batch 维）
+    aux_data = aux_processor.preprocess(img, return_tensors="pt")
     images_aux = aux_data["pixel_values"]
 
-    # 4. 构建 prompt（vLLM 标准格式 + <objfeat>）
-    # <image> 不在 vocab 中，用 <|image_pad|> 代替（vLLM processor 会自动展开）
+    # 4. 构建 prompt（<objfeat> 会被 processor 替换为 248181）
     prompt = (
         "<|im_start|>user\n"
         "<|vision_start|><|image_pad|><|vision_end|>\n"
@@ -69,7 +69,7 @@ def main() -> None:
     print("=" * 60)
     print("2) object features 生成（图像 + 2 个 bbox）")
     print(f"prompt: {prompt!r}")
-    print(f"bbox_list: {bbox_list}")
+    print(f"bbox_list: {bbox_list.shape} -> {bbox_list}")
     print(f"images_aux shape: {images_aux.shape}")
 
     t0 = time.perf_counter()

@@ -412,25 +412,31 @@ class VLXSeek1_5ForCausalLM(_VllmQwen3_5VLM):
 
         # 计算 vt_images_size（从 grid_thw 推断原图尺寸）
         patch_size = self.visual.config.patch_size
-        grid_list = grid_thw.tolist()
-        if len(grid_list) == 1 and isinstance(grid_list[0], list):
-            grid_list = [grid_list]
         image_grid_thws = [grid_thw[i:i + 1] for i in range(len(grid_thw))]
         vt_images_size = [thw[0][-2:] * patch_size for thw in image_grid_thws]
 
-        # encode_objects 期望 images_aux 是 list of [1, C, H, W] tensor
+        # encode_objects 期望 images_aux 是 list of [C, H, W] tensor。
+        # vLLM batched 字段切分后可能是 list of [C,H,W] / [1,C,H,W] / 单个 tensor。
         if isinstance(images_aux, torch.Tensor):
-            # 单张图：tensor -> list
-            if images_aux.ndim == 3:
-                images_aux = [images_aux.unsqueeze(0)]
-            elif images_aux.ndim == 4:
-                images_aux = [images_aux[i] for i in range(len(images_aux))]
-        elif not isinstance(images_aux, list):
             images_aux = [images_aux]
+        # 逐项规整：去掉多余的 batch 维（[1,C,H,W] -> [C,H,W]）
+        normalized_aux = []
+        for item in images_aux:
+            if isinstance(item, torch.Tensor) and item.ndim == 4 and item.shape[0] == 1:
+                item = item[0]
+            normalized_aux.append(item)
+        images_aux = normalized_aux
 
-        # bbox_list 期望是 list of tensor
+        # bbox_list 期望是 list of [N, 4] tensor。
         if isinstance(bbox_list, torch.Tensor):
-            bbox_list = [bbox_list]
+            if bbox_list.ndim == 3:
+                # [1, N, 4] -> list of [N, 4]
+                bbox_list = [bbox_list[i] for i in range(len(bbox_list))]
+            else:
+                bbox_list = [bbox_list]
+        elif isinstance(bbox_list, list) and len(bbox_list) > 0 and isinstance(bbox_list[0], torch.Tensor) and bbox_list[0].ndim == 3:
+            # list of [1, N, 4] -> list of [N, 4]
+            bbox_list = [b[0] if b.shape[0] == 1 else b for b in bbox_list]
 
         object_features = self.encode_objects(
             images_aux, bbox_list, vt_multi_level_features, vt_images_size
