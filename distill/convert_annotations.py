@@ -140,12 +140,21 @@ def load_names(names_path: str | Path) -> list[str]:
     if not text:
         return []
     if text.lstrip().startswith("names:") or "path:" in text.splitlines()[0]:
+        # data.yaml 布局（含 path/train/val 等键）：只取 names: 之后 "数字: 类别名" 的行
         names: list[str] = []
-        for line in text.splitlines()[1:]:
-            line = line.strip()
-            if not line or ":" not in line:
+        in_names = False
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("names:"):
+                in_names = True
                 continue
-            _, _, val = line.partition(":")
+            if not in_names:
+                continue
+            if not stripped or ":" not in stripped:
+                continue
+            key, _, val = stripped.partition(":")
+            if not key.strip().isdigit():
+                continue
             names.append(val.strip().strip("\"'"))
         return names
     return [ln.strip() for ln in text.splitlines() if ln.strip()]
