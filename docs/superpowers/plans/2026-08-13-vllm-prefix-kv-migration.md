@@ -73,6 +73,8 @@ vLLM 的 ModelConfig 校验走 transformers 架构注册表，`model_type: vlx_s
 **里程碑 1a 验证**（服务器）：text-only 生成通过 = 注册+config+权重+引擎全链路打通
 **里程碑 1b（未做）**：自定义 MultiModalProcessor——处理 `images_aux/image_grid_thws/bbox_list` 输入、让 `<objfeat>` 占位符进入 `is_multimodal` 掩码、图像 token 数按 grid thw 展开
 
+**1a 实测发现（2026-08-13）**：vllm 环境 transformers 4.57.6 **无 `transformers.models.qwen3_5`**（qwen3_5 modeling 属 transformers 5.x）→ 项目视觉塔（依赖 `Qwen3_5VisionModel`）无法导入。修复：vllm 环境升级 transformers==5.13.0（与项目一致），vLLM 0.17 对 transformers 5.x 的兼容性待实测（若 `import vllm` 崩则回退 4.57.6 并在 vllm_serve 内自实现视觉塔）。
+
 ## 关键架构决策
 
 1. **自定义多模态模型注册（本计划最大工程点）**：vLLM 不识别 OmChat 式自定义 VLM。需要：
