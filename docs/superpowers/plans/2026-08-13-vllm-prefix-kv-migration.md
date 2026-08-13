@@ -80,6 +80,25 @@ vLLM 的 ModelConfig 校验走 transformers 架构注册表，`model_type: vlx_s
 2. transformers 5.13 的 `PretrainedConfig` 改为 dataclass 机制，`from_dict` 会先把嵌套 `text_config`/`vision_config` 转成对象传入 `__init__`，而 vLLM 的 `Qwen3_5Config.__init__` 只处理 dict/None → 对象被静默丢弃 → 需在 `VLXSeek1_5Config.__init__` 兜底解析并强制写回属性（已修复）；
 3. vLLM 为 Qwen3.5 VLM 初始化 mm budget 时会加载 **video 处理器**（VLX-Seek 纯图像模型用不到）：checkpoint 需补 `video_preprocessor_config.json`，且 **`video_processor_type` 的值必须是处理器类名 `"Qwen3VLVideoProcessor"`（不是 model_type "qwen3_5"）**，否则 `video_processor_class_from_name` 解析失败直接报 Unrecognized。
 
+## Task 1 实际完成情况（2026-08-13，1a + 1b 全部打通）
+
+**1a 调试链（worker 注册丢失 → 权重加载）**：
+1. **worker 进程注册丢失**：CUDA 初始化后 vLLM 强制 spawn，主进程 `plugin.init()` 注册不传子进程（EngineCore_DP0 报 `Model architectures ['VLXSeek1_5ForCausalLM'] are not supported`）→ 方案：pyproject 声明 `[project.entry-points."vllm.general_plugins"] vllm-seek = "vllm_serve.plugin:init"` + `package=true` + 服务器 `uv pip install -e . --no-deps`，`plugin.py` 幂等守卫
+2. **权重键映射**：checkpoint `model.vision_tower.visual.blocks.*` → 模型 `visual.visual.blocks.*`（只替换第一段 `vision_tower`→`visual`）；`model.language_model.*` → `language_model.model.*` + `lm_head` 模式照抄 Qwen3VL
+3. **aux 塔 buffer**：C-RADIOv4 的 `input_conditioner.norm_mean/norm_std`、`radio_model.summary_idxs` 是 nn.Buffer（非 Parameter），AutoWeightsLoader 报缺失 → `c_radio_v4_aux_encoder.py` 自定义 `load_weights` 分离 buffer 键手动 copy_；外层用 `ignore_unexpected_prefixes` 防下钻
+4. **内层 loader 前缀**：`CRadioV4AuxEncoder.load_weights` 收到的键已去掉 `vision_tower_aux.` 前缀但仍有 `image_tower.` → 传给内层 `AutoWeightsLoader(self.image_tower)` 前剥掉 `image_tower.`
+
+**1a 性能结论（关键）**：CUDA graph 对 hybrid mamba 架构捕获不匹配，text-only 生成 61.5s（0.23 tok/s）；**`enforce_eager=True` 后 2.7s（5.63 tok/s），23× 提升** → 所有 vLLM 推理统一走 enforce_eager
+
+**1b 调试链（多模态输入路径）**：
+1. `_parse_and_validate_multimodal_inputs` 找 `pixel_values` 键 → 删除自定义 `embed_multimodal` 解析，改为覆盖 `_process_image_input`（基类解析 + 自定义视觉编码）
+2. `_call_hf_processor` 签名是 `(prompt, mm_data, mm_kwargs, tok_kwargs)`（非旧版 2 参）；`bbox_list/images_aux` 从 mm_kwargs 提取、不传 HF processor，合并回 BatchFeature
+3. `MULTIMODAL_REGISTRY` 导入路径是 `vllm.multimodal`（非 `vllm.model_executor.models.registry`）
+4. **字段 batch 合并**：`images_aux` 须用 CLIPImageProcessor（C-RADIOv4 配置）输出 `[1,C,H,W]`；`bbox_list` 带 batch 维 `[1,N,4]`；`_get_mm_fields_config` 声明为 batched image 字段
+5. **embeddings 数量校验**：`sanity_check_mm_encoder_outputs` 要求 `len(mm_embeddings) == num_items`（1 个 image item → 1 个元素）→ `embed_multimodal` 返回 `(torch.cat([image_embeds, object_embeds]),)` 单元素 tuple，图像+object 合并
+
+**1b-2 实测（服务器）**：`test_object_features.py`（纯红图 + 2 bbox + `<objfeat>` 占位符）→ 输出 `'一个红色的背景'`，22.3s（含 11s rendering）。**1a/1b 里程碑全部达成**。commit 历史：`6584440`→`94aa62a`→`fcd325c`→`3637a83`→`f507c81`→`fb99313`→`e7978de`→`25c51b5`→`f8def74`→`39851ca`→`3b5c34f`→`4e9c2b9`
+
 ## 关键架构决策
 
 1. **自定义多模态模型注册（本计划最大工程点）**：vLLM 不识别 OmChat 式自定义 VLM。需要：
