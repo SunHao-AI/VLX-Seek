@@ -80,7 +80,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--prompt-map",
         default=str(Path(__file__).resolve().parent / "data" / "category_prompts.json"),
-        help="类别 prompt 映射文件（generate_prompts.py 输出）。用于把 COCO categories.name" " 从推理 prompt 还原为真实中文类别名；文件不存在或缺少 prompt_to_category 时保持原样。",
+        help="类别 prompt 映射文件（generate_prompts.py 输出）。用于把 COCO categories.name"
+        " 从推理 prompt 还原为真实中文类别名；文件不存在或缺少 prompt_to_category 时保持原样。",
     )
     parser.add_argument("--model-path", default="resources/VLX-Seek-1.5-10B")
     parser.add_argument(
