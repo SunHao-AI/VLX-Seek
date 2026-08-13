@@ -112,7 +112,19 @@ vLLM 的 ModelConfig 校验走 transformers 架构注册表，`model_type: vlx_s
 
 **收益实测**：14 个共享前缀请求 24.3s vs 串行 ~280s+，**~11× 加速**；输出与单请求一致（`'一个红色的背景'` 等）。
 
-## Task 3/4 待办（2026-08-13）
+## Task 3 实施状态（2026-08-13）
+
+已提交 `vllm_serve/vlx_seek_vllm_worker.py`（与 VLXSeekWorker 同接口：`predict/predict_batch/run_task/detect/detect_multi_prompt/ground/count/encode_image_cache(no-op)/clear_image_cache(no-op)`）：
+- prompt 构建：`<image>` → `<|image_pad|>`（vLLM processor 自动展开），`<objfeat>` 占位符由自定义 processor 替换
+- 批量提交：detect_multi_prompt 一次 llm.generate 提交所有类别批次（同图共享前缀）
+- 结果解析：复用 VLXSeekWorker 静态工具（_validate_boxes/_remap_*/_build_result_bbox_list）
+- `distill/generate_pseudo_labels.py` 新增 `--backend hf|vllm`（默认 hf 零行为变化）
+
+**冒烟测试通过（服务器）**：detect_multi_prompt（2 批 21.25s）、detect（5.72s）、predict_batch（5.64s，批量共享前缀生效）。接口格式与 HF worker 一致。
+
+**待办（Task 3 Step 3）**：HF vs vLLM 输出一致性回归（真实图片，两环境各跑 1 张图对比检测结果）。
+
+## Task 4 待办（2026-08-13）
 
 ## 关键架构决策
 
