@@ -21,9 +21,13 @@ from typing import Iterable, Optional, Set
 import torch
 
 from transformers import AutoConfig
-from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5Config
 
 from vllm.config import VllmConfig
+# 必须继承 vLLM 自己的 Qwen3_5Config（vllm.transformers_utils.configs.qwen3_5），
+# 否则 Qwen3_5ProcessingInfo.get_hf_config 的 isinstance 校验失败
+# （报错：Expected type vllm...Qwen3_5Config, found vlx_seek_vlm.VLXSeek1_5Config）
+from vllm.transformers_utils.configs.qwen3_5 import Qwen3_5Config as _VllmQwen3_5Config
+
 from vllm.model_executor.models.qwen3_5 import (
     Qwen3_5ForCausalLM as _VllmQwen3_5ForCausalLM,
     Qwen3_5ForConditionalGeneration as _VllmQwen3_5VLM,
@@ -46,7 +50,7 @@ from vlx_seek.models.vlx_seek_1_5.multimodal_encoder.qwen3_5_vl_encoder import Q
 from vlx_seek.models.vlx_seek_1_5.omchat_arch import _infer_aux_spatial_scale
 
 
-class VLXSeek1_5Config(Qwen3_5Config):
+class VLXSeek1_5Config(_VllmQwen3_5Config):
     """最小 config 类：仅用于让 transformers AutoConfig 认识 vlx_seek_1_5。
 
     from_pretrained 会把 config.json 的全部字段注入该类，自定义字段
