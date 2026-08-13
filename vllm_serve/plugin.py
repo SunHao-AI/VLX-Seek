@@ -10,9 +10,20 @@ vLLM 会在引擎初始化前自动调用 init()，覆盖所有 worker 子进程
 """
 from __future__ import annotations
 
+_initialized = False
+
 
 def init() -> None:
-    """注册 VLX-Seek config 与 vLLM 模型类（幂等）。"""
+    """注册 VLX-Seek config 与 vLLM 模型类（幂等，可多进程重复调用）。
+
+    vLLM 0.17 会在 process0 / engine core / worker 每个进程调用一次
+    （vllm.general_plugins 入口点或 sitecustomize），必须幂等。
+    """
+    global _initialized
+    if _initialized:
+        return
+    _initialized = True
+
     from .vlx_seek_vlm import VLXSeek1_5ForCausalLM, register_config
     from vllm.model_executor.models.registry import ModelRegistry
 

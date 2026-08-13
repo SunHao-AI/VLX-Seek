@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "vlx-seek"
 version = "1.5.0"
@@ -31,6 +35,19 @@ flash-attn = [
 distill = [
     "ultralytics",
 ]
+# vLLM 推理环境（.venv-vllm）需要但 vllm 未自动引入的 GPU 栈依赖
+vllm-gpu = [
+    "timm==1.0.9",
+    "einops==0.6.1",
+    "torchvision==0.25.0",
+]
+
+# vLLM 0.17 通用插件入口：vLLM 会在 process0 / engine core / worker 每个
+# 进程加载本入口点并调用 init()，从而把 VLXSeek1_5ForCausalLM 注册进
+# ModelRegistry（spawn 子进程不继承主进程注册，必须通过入口点）。
+# 安装方式：uv pip install -e . --no-deps（可编辑安装使入口点生效）
+[project.entry-points."vllm.general_plugins"]
+vllm-seek = "vllm_serve.plugin:init"
 
 [tool.uv.extra-build-dependencies]
 # flash-attn 源码构建时 setup.py 需要 import torch（它未声明为构建依赖），
@@ -41,10 +58,15 @@ flash-attn = ["torch==2.10.0"]
 [tool.uv]
 # 固定 Python 版本，保证虚拟环境一致性
 python-preference = "only-managed"
-package = false
+# 作为包构建：声明 vllm.general_plugins 入口点需要可构建/可编辑安装
+package = true
 # 使用国内 PyPI 镜像加速依赖下载（阿里云优先；备选清华 https://pypi.tuna.tsinghua.edu.cn/simple）
 index-url = "https://mirrors.aliyun.com/pypi/simple/"
 
 [tool.uv.sources]
 # cv_utils 从 gitee 仓库安装（PyPI 无对应版本时）
 cv-utils = { git = "https://gitee.com/SunHao-AI/cv_utils.git" }
+
+[tool.setuptools]
+# 只打包 vllm_serve（其余为源码目录，通过 import 路径使用）
+packages = ["vllm_serve"]
