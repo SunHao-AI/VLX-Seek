@@ -80,8 +80,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--prompt-map",
         default=str(Path(__file__).resolve().parent / "data" / "category_prompts.json"),
-        help="类别 prompt 映射文件（generate_prompts.py 输出）。用于把 COCO categories.name"
-        " 从推理 prompt 还原为真实中文类别名；文件不存在或缺少 prompt_to_category 时保持原样。",
+        help="类别 prompt 映射文件（generate_prompts.py 输出）。用于把 COCO categories.name" " 从推理 prompt 还原为真实中文类别名；文件不存在或缺少 prompt_to_category 时保持原样。",
     )
     parser.add_argument("--model-path", default="resources/VLX-Seek-1.5-10B")
     parser.add_argument(
@@ -91,7 +90,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--lang", choices=("en", "zh"), default="en")
-    parser.add_argument("--max-new-tokens", type=int, default=2048)
+    parser.add_argument("--max-new-tokens", type=int, default=1024)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument(
         "--min-area",
@@ -123,6 +122,17 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="每个子提示词包含的类别数上限。0 表示不拆分（默认）。设为 30 则每 30 个类别一组循环推理。",
     )
+    parser.add_argument(
+        "--max-proposals",
+        type=int,
+        default=100,
+        help="WeDetect 每个裁剪块保留的最大候选框数（proposals 已按分数降序）。调小可缩短 prompt 和解码。",
+    )
+    parser.add_argument(
+        "--log-timing",
+        action="store_true",
+        help="打印每次 generate 的耗时与 token 数（用于定位 prefill/decode 耗时分布）。",
+    )
     return parser.parse_args()
 
 
@@ -142,9 +152,16 @@ def get_wedetect_generator(detector_checkpoint: str):
     return _wedetect_generator
 
 
-def load_proposals(image: Image.Image, detector_checkpoint: str) -> list[list[float]]:
+def _truncate_proposals(boxes: list[list[float]], max_proposals: int) -> list[list[float]]:
+    """proposals 已按分数降序，截断到前 max_proposals 个（<=0 不过滤）。"""
+    if max_proposals > 0 and len(boxes) > max_proposals:
+        return boxes[:max_proposals]
+    return boxes
+
+
+def load_proposals(image: Image.Image, detector_checkpoint: str, max_proposals: int = 100) -> list[list[float]]:
     """复用 inference.py 的 WeDetect proposal 生成逻辑（进程内缓存模型）。"""
-    return get_wedetect_generator(detector_checkpoint)(image)
+    return _truncate_proposals(get_wedetect_generator(detector_checkpoint)(image), max_proposals)
 
 
 def _add_annotations(
@@ -193,7 +210,7 @@ def detect_with_crop(
         for slc in slices:
             crop = slc.image
             try:
-                boxes = generator(crop)
+                boxes = _truncate_proposals(generator(crop), args.max_proposals)
                 if args.prompt_batch_size > 0 and len(categories) > args.prompt_batch_size:
                     category_batches = _split_categories(categories, args.prompt_batch_size)
                     worker.encode_image_cache(crop, boxes)
@@ -319,6 +336,8 @@ def run_pipeline(args: argparse.Namespace, image_paths: list[Path] | None = None
 
     worker = VLXSeekWorker(args.model_path, device=args.device)
 
+    worker.log_timing = args.log_timing
+
     next_image_id = max((img["id"] for img in coco["images"]), default=-1) + 1
     next_ann_id = max((ann["id"] for ann in coco["annotations"]), default=-1) + 1
 
@@ -344,7 +363,7 @@ def run_pipeline(args: argparse.Namespace, image_paths: list[Path] | None = None
                 detections = detect_with_crop(image, worker, categories, args, cat_id_map)
             elif use_batch:
                 category_batches = _split_categories(categories, args.prompt_batch_size)
-                boxes = load_proposals(image, args.detector_checkpoint)
+                boxes = load_proposals(image, args.detector_checkpoint, args.max_proposals)
                 worker.encode_image_cache(image, boxes)
                 result = worker.detect_multi_prompt(
                     image,
@@ -357,7 +376,7 @@ def run_pipeline(args: argparse.Namespace, image_paths: list[Path] | None = None
                 worker.clear_image_cache()
                 detections = [(rb["label"], rb["xmin"], rb["ymin"], rb["xmax"], rb["ymax"]) for rb in result.get("result_bbox_list", [])]
             else:
-                boxes = load_proposals(image, args.detector_checkpoint)
+                boxes = load_proposals(image, args.detector_checkpoint, args.max_proposals)
                 result = worker.detect(
                     image,
                     boxes,
