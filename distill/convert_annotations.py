@@ -330,7 +330,7 @@ def parse_labelme(labelme_dir: str | Path, w: Warnings) -> list[Image]:
 
 
 def export_labelme(images: list[Image], out_dir: str | Path, w: Warnings) -> None:
-    """list[Image] -> LabelMe JSON（每图一个，imageData 留空）。"""
+    """list[Image] -> LabelMe JSON（每图一个，imageData 为 null）。"""
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     for img in images:
@@ -356,7 +356,7 @@ def export_labelme(images: list[Image], out_dir: str | Path, w: Warnings) -> Non
             "flags": {},
             "shapes": shapes,
             "imagePath": img.file_name,
-            "imageData": "",
+            "imageData": None,
             "imageWidth": img.width,
             "imageHeight": img.height,
         }

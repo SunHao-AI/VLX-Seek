@@ -181,7 +181,7 @@ python distill/convert_annotations.py coco2labelme \
   --out-dir distill/data/labelme
 ```
 
-- 每张图输出一个同名 `.json`（bbox 转为 `rectangle`，segmentation 转为 `polygon`），`imageData` 为空字符串，可配合 `labelme` 工具人工修正。
+- 每张图输出一个同名 `.json`（bbox 转为 `rectangle`，segmentation 转为 `polygon`），`imageData` 为 `null`（不含内嵌图片），可配合 `labelme` 工具人工修正。
 
 ### LabelMe → COCO
 
