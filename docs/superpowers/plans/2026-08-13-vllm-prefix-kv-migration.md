@@ -39,6 +39,40 @@
 | 提高 decode 利用率 | 多请求共享一个 decode step 的带宽/算力 | 吞吐 5-20× |
 | 多卡利用 | tensor parallel / 引擎层多卡调度 | 与切片级分片正交 |
 
+## M0 实测结果（2026-08-13，服务器）
+
+**环境（.venv-vllm 独立环境）**：8×RTX 5880 Ada（sm89）、torch 2.10.0+cu130（`uv pip install --torch-backend=auto` 自动选择）、vllm 0.17.0、transformers 4.57.6、flash_attn 未装（警告，非必需）。
+
+**直接加载结果**：`LLM(model=..., trust_remote_code=True)` **失败**（预期内）——
+```
+Value error, The checkpoint you are trying to load has model type `vlx_seek_1_5`
+but Transformers does not recognize this architecture.
+```
+vLLM 的 ModelConfig 校验走 transformers 架构注册表，`model_type: vlx_seek_1_5` 不被识别；`trust_remote_code` 参数被忽略（"It has no effect here"）。vLLM 0.17 虽原生支持 Qwen3.5，但只认标准架构名，不会映射自定义名。
+
+**Gate 结论：通过（按预期失败路径）→ Task 1 自定义注册**。两条修正：
+1. `ModelRegistry.register_model` 的注册键应使用 config 的 architecture 名 `VLXSeek1_5ForCausalLM`（vLLM 用架构名解析，不是 model_type）
+2. HF 基线对比在 vllm 环境不可行（transformers 4.57.6 vs 项目 5.13 + 缺项目依赖），一致性回归统一放到项目环境做（Task 3）
+
+## vLLM 0.17 自定义注册 API 调研结论（2026-08-13）
+
+- **语言主干直接复用**：vLLM 0.17 内置 `Qwen3_5ForConditionalGeneration`（`vllm/model_executor/models/qwen3_5.py:630`），VLX-Seek 继承它即可
+- **新协议**（旧版 `get_multimodal_embeddings/get_input_embeddings/merge_multimodal_embeddings` 已不存在）：`embed_multimodal(**kwargs) -> MultiModalEmbeddings`（返回待合并嵌入）+ `embed_input_ids(input_ids, multimodal_embeddings, *, is_multimodal)`（默认实现内含合并）
+- **注册**：`ModelRegistry.register_model(架构名, "模块:类"懒加载串)`，经 `vllm.general_plugins` entry point 在引擎前加载；注册后 ModelConfig 校验直接命中注册表，**绕过 transformers 架构校验**（M0 那条 `vlx_seek_1_5 not recognized` 报错消失）
+- **config 加载**：vLLM 用 transformers AutoConfig 读 config.json，`model_type=vlx_seek_1_5` 需自行 `AutoConfig.register`（vllm_serve 里定义了最小 `VLXSeek1_5Config(Qwen3_5Config)`）
+- **权重**：`load_weights` 钩子 + `WeightsMapper(orig_to_new_prefix=...)` + `AutoWeightsLoader`（照抄 Qwen3VL 的 `model.language_model.→language_model.model.`、`lm_head.→language_model.lm_head.` 模式）
+- **bbox/object feature 通道 vLLM 无原生支持**：需自定义 MultiModalProcessor / data parser（最大工作量，下个里程碑）
+
+## Task 1 实施状态（2026-08-13）
+
+已提交 `vllm_serve/` 三件套（v0 实现，待服务器验证迭代）：
+- `vlx_seek_vlm.py`：`VLXSeek1_5Config` + `VLXSeek1_5ForCausalLM`（继承 vLLM Qwen3.5 VLM，替换视觉栈为项目模块：vision_tower / mm_projector / vision_tower_aux / HFRE / mm_projector_aux；`encode_images/encode_objects` 逐字移植；`embed_multimodal` 图像+object 双通道；`load_weights` + mapper）
+- `plugin.py`：注册 config + 模型（懒加载串）
+- `test_vllm.py`：text-only + 图像冒烟测试
+
+**里程碑 1a 验证**（服务器）：text-only 生成通过 = 注册+config+权重+引擎全链路打通
+**里程碑 1b（未做）**：自定义 MultiModalProcessor——处理 `images_aux/image_grid_thws/bbox_list` 输入、让 `<objfeat>` 占位符进入 `is_multimodal` 掩码、图像 token 数按 grid thw 展开
+
 ## 关键架构决策
 
 1. **自定义多模态模型注册（本计划最大工程点）**：vLLM 不识别 OmChat 式自定义 VLM。需要：
