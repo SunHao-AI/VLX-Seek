@@ -147,6 +147,15 @@ def load_names(names_path: str | Path) -> list[str]:
             stripped = line.strip()
             if stripped.startswith("names:"):
                 in_names = True
+                inline = stripped.partition(":")[2].strip()
+                if inline.startswith("{"):
+                    # 内联 dict 格式：names: {0: a, 1: b}
+                    for item in inline.strip("{}").split(","):
+                        key, _, val = item.partition(":")
+                        if not key.strip().isdigit():
+                            continue
+                        names.append(val.strip().strip("\"'"))
+                    return names
                 continue
             if not in_names:
                 continue
@@ -208,23 +217,27 @@ def parse_yolo(image_dir: str | Path, label_dir: str | Path, names: list[str],
             if len(parts) < 5:
                 w.warn(f"{label_path.name}: 非法行，跳过：{ln}")
                 continue
-            cls = int(float(parts[0]))
+            try:
+                cls = int(float(parts[0]))
+                nums = [float(v) for v in parts[1:]]
+            except ValueError:
+                w.warn(f"{label_path.name}: 非法数值行，跳过：{ln}")
+                continue
             if cls >= len(names):
                 w.warn(f"{label_path.name}: class_id {cls} 超出 names 范围，跳过")
                 continue
             if len(parts) == 5:
-                cx, cy, nw, nh = (float(v) for v in parts[1:])
+                cx, cy, nw, nh = nums
                 x = (cx - nw / 2) * width
                 y = (cy - nh / 2) * height
                 objs.append(Object(category_name=names[cls], category_id=cls,
                                    bbox_xywh=[x, y, nw * width, nh * height]))
             else:
-                if (len(parts) - 1) % 2 != 0:
+                if len(nums) % 2 != 0:
                     w.warn(f"{label_path.name}: seg 行坐标数非法，跳过：{ln}")
                     continue
-                vals = [float(v) for v in parts[1:]]
-                points = [[vals[i] * width, vals[i + 1] * height]
-                          for i in range(0, len(vals), 2)]
+                points = [[nums[i] * width, nums[i + 1] * height]
+                          for i in range(0, len(nums), 2)]
                 objs.append(Object(category_name=names[cls], category_id=cls,
                                    polygon=points))
         images.append(Image(id=len(images), file_name=img_file,
@@ -305,11 +318,14 @@ def parse_labelme(labelme_dir: str | Path, w: Warnings) -> list[Image]:
         if not objs:
             w.warn(f"{json_path.name}: 无有效标注，跳过该图")
             continue
+        width = int(data.get("imageWidth", 0))
+        height = int(data.get("imageHeight", 0))
+        if width <= 0 or height <= 0:
+            w.warn(f"{json_path.name}: 缺 imageWidth/imageHeight，跳过该图")
+            continue
         images.append(Image(id=len(images),
                             file_name=data.get("imagePath", json_path.stem),
-                            width=int(data.get("imageWidth", 0)),
-                            height=int(data.get("imageHeight", 0)),
-                            objects=objs))
+                            width=width, height=height, objects=objs))
     return images
 
 
