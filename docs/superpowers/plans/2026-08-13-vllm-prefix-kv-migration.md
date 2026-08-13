@@ -17,6 +17,19 @@
 - 单次耗时构成：decode 是主体（batch=1，10B bf16 在 5880 ≈ 960 GB/s 带宽 → 25~35 tok/s）+ 每次全量重算共享前缀 prefill
 - `encode_image_cache` 只跳过 vision tower，LLM 层 KV 不复用；14 组 prompt 的图像+object 前缀（占 prompt ~90%）完全相同
 
+## 版本兼容性调研结论（2026-08-13 Web 检索，M0 需在服务器实测确认）
+
+| 候选 | torch | transformers | Qwen3.5 支持 | 备注 |
+|---|---|---|---|---|
+| **vLLM 0.17.0（首选）** | 2.10.0（**与项目一致**） | 社区记录 4.56.2 规避 AuxRequest/flex_attention 问题；**对 transformers 5.x 兼容性未知** | ✅ 原生支持 | 与项目 torch 完全匹配；需在 M0 实测 transformers 5.13.0 能否加载，若报错则需在 a) 项目 transformers 降级（影响 HF 路径，风险大）与 b) 换 vLLM 0.20+ 之间抉择 |
+| vLLM 0.20.0（2026-04） | 2.11（默认 CUDA 13） | v5 兼容性修复（>=5） | 部分（Qwen3-Next/3.5 相关支持） | torch 2.11 与项目 2.10 不匹配，需项目级 torch 升级 |
+| vLLM 0.22.0 | 要求 torch==2.11.0 | >=4.56.0 | — | 同上，torch 升级成本 |
+| NVIDIA NGC 26.02 容器 | 2.11.0a0 | 4.57.5 | — | 容器化备选（含 flash-attn 2.7.4.post1） |
+
+**M0 验证顺序**：vLLM 0.17.0 + 项目 torch 2.10.0 + transformers 5.13.0 直接试装 → 不兼容则按上表决策。
+
+**vLLM 自定义多模态 API 现状（Next/latest 文档）**：`ModelRegistry.register_model("VLXSeek1_5ForCausalLM", "vllm_serve.vlx_seek_vlm:VLXSeek1_5ForCausalLM")`（插件式注册，建议放 vLLM 插件避免 fork 子进程 CUDA 重初始化问题）；模型类实现 `SupportsMultiModal`，提供 `get_multimodal_embeddings()`（返回 `(num_items, feature_size, hidden_size)` 3D 张量）与 `get_input_embeddings()`（用 `merge_multimodal_embeddings` 合并占位 token）；`MULTIMODAL_REGISTRY.register_processor(processor, info=..., dummy_inputs=...)` 注册处理器。注意旧版（v0.7 系）API 是 `register_image_input_mapper`，以实际安装版本为准（M0 时在服务器 `pip show vllm` + 查对应版本文档确认）。
+
 ## vLLM 收益点
 
 | 收益 | 机制 | 预期 |
