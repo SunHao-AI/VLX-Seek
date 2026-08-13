@@ -71,7 +71,7 @@ def print_install_guidance() -> None:
     print()
 
 
-def verify_and_benchmark() -> None:
+def verify_and_benchmark() -> bool:
     print("=" * 60)
     print("3) flash_attn kernel 验证与微基准")
     print("=" * 60)
@@ -79,11 +79,11 @@ def verify_and_benchmark() -> None:
         from flash_attn import flash_attn_func
     except ImportError as exc:
         print(f"  [错误] flash_attn 导入失败: {exc}", file=sys.stderr)
-        return
+        return False
 
     if not torch.cuda.is_available():
         print("  [跳过] 无 CUDA 设备，无法运行 kernel 验证。")
-        return
+        return False
 
     torch.manual_seed(0)
     batch, nheads, head_dim = 1, 8, 128
@@ -140,6 +140,7 @@ def verify_and_benchmark() -> None:
         speedup = sdpa_ms / fa_ms if fa_ms > 0 else float("inf")
         print(f"    {label:<22} flash_attn={fa_ms:8.3f}  sdpa={sdpa_ms:8.3f}  加速比={speedup:.2f}x")
     print()
+    return True
 
 
 def main() -> None:
@@ -152,8 +153,12 @@ def main() -> None:
         print("结论: flash_attn 未安装，VLX-Seek 将使用 PyTorch 内置 SDPA。")
         sys.exit(1)
 
-    verify_and_benchmark()
-    print("结论: flash_attn 已安装且 kernel 验证通过（见上方微基准）。")
+    verified = verify_and_benchmark()
+    if verified:
+        print("结论: flash_attn 已安装且 kernel 验证通过（见上方微基准）。")
+    else:
+        print("结论: flash_attn 已安装，但 kernel 验证失败或跳过，VLX-Seek 实际回退 SDPA。")
+        sys.exit(2)
 
 
 if __name__ == "__main__":
