@@ -179,6 +179,45 @@ python inference.py \
 
 Detection results are printed as JSON and visualized to `<image_stem>_result.png` by default. See the **[complete inference guide](docs/inference.md)** for all tasks, custom proposals, generation options, output fields, and the Python API.
 
+## Pseudo-Label Distillation
+
+`distill/generate_pseudo_labels.py` generates COCO-format pseudo labels in batch with VLX-Seek, for distilling lightweight detectors such as YOLO-World. Pipeline: WeDetect recalls candidate regions → VLX-Seek open-vocabulary detection → filtering and merging into COCO JSON. Category prompts can be produced by `distill/generate_prompts.py` (its `prompt_to_category` mapping restores real category names in the COCO `categories.name` field).
+
+### Recommended run script (vLLM, multi-GPU)
+
+Run on an 8×RTX 5880 Ada(48GB) server in the `.venv-vllm` environment:
+
+```bash
+# Large sliding-window crops (2500×2500) reduce the slice count; before the crop
+# enters VLX-Seek it is letterboxed to --letterbox-size to control vision-tower
+# VRAM. WeDetect still proposes on the native-resolution crop.
+.venv-vllm/Scripts/python distill/generate_pseudo_labels.py \
+  --image-dir distill/data/images \
+  --categories "dense crowd; road construction area; turbid water body; helmet" \
+  --output distill/data/pseudo_labels.json \
+  --model-path resources/VLX-Seek-1.5-10B \
+  --backend vllm \
+  --prompt-batch-size 50 \
+  --gpu-ids "0,1,2,3,4,5,6,7" \
+  --slice-width 2500 --slice-height 2500 \
+  --letterbox-size 1024 \
+  --max-new-tokens 1024 \
+  --resume
+```
+
+### Key parameters
+
+| Parameter | Recommended | Description |
+| --- | --- | --- |
+| `--backend vllm` | - | Keeps the vLLM engine resident; multi-batch category prompts of the same crop share the image + object prefix KV (prefix caching) |
+| `--gpu-ids` | `0,1,2,3,4,5,6,7` | Multi-GPU parallelism; images are round-robin sharded and each GPU writes its own shard file |
+| `--slice-width / --slice-height` | `2500` | Sliding-window crop size. Large crops reduce the slice count (VRAM controlled by letterbox); shrink for small-object-heavy scenes |
+| `--letterbox-size` | `1024` | Letterbox target (long side) before VLX inference (default 1024, `0` disables). Images larger than the target are scaled + center-padded with gray; bboxes are transformed and restored automatically. Lower it (896/768) when VRAM is tight, raise it (1536/2048) for more detail |
+| `--prompt-batch-size` | `50` | Groups up to 50 categories per prompt to bound single-request length |
+| `--max-proposals` | `100` | Max candidate boxes kept per crop (already sorted by score); smaller shortens prompt and decoding |
+| `--max-new-tokens` | `1024` | Decoding budget; avoids truncated output on large crops |
+| `--resume` | - | Resumes by skipping images already present in the output |
+
 ## Problem Setting
 
 Embodied and edge-side visual systems need stable spatial anchors. Monitoring cameras, drones, robots, robot dogs, mobile devices, and inspection systems often need to know not only "what is visible", but also:

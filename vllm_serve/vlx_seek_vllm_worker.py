@@ -18,7 +18,12 @@ import torch
 from PIL import Image
 
 from vlx_seek.task_templates import build_prompt
-from vlx_seek_worker import VLXSeekWorker  # 复用静态解析工具（_validate_boxes 等）
+from vlx_seek_worker import (  # 复用静态解析工具与 letterbox 工具
+    VLXSeekWorker,
+    letterbox_image,
+    scale_boxes,
+    unscale_boxes,
+)
 
 
 class VLXSeekVLLMWorker:
@@ -36,6 +41,7 @@ class VLXSeekVLLMWorker:
         gpu_memory_utilization: float = 0.7,
         tensor_parallel_size: int = 1,
         max_model_len: int = 8192,
+        letterbox_size: int = 0,
     ):
         import vllm_serve.plugin
         vllm_serve.plugin.init()
@@ -45,6 +51,9 @@ class VLXSeekVLLMWorker:
         self.model_path = model_path
         self.device = torch.device(device)
         self.log_timing = False  # True 时每次 generate 输出耗时日志
+        # 推理前 letterbox 的长边目标尺寸（像素），与 VLXSeekWorker 语义一致：
+        # >0 时对超尺寸图先缩放+居中补边，bbox 同步变换，结果还原回原图坐标。
+        self.letterbox_size = letterbox_size
 
         self.llm = LLM(
             model=model_path,
@@ -52,6 +61,9 @@ class VLXSeekVLLMWorker:
             tensor_parallel_size=tensor_parallel_size,
             enforce_eager=True,  # hybrid mamba 架构下 CUDA graph 捕获不匹配，必须 eager
             max_model_len=max_model_len,
+            # 同 crop 的多个类别批次请求共享图像+object 前缀 token，
+            # 开启后 KV 只存一份前缀，避免多请求累积把显存顶爆。
+            enable_prefix_caching=True,
         )
 
         # vLLM 的 outputs[0].text 默认 skip_special_tokens=True，会丢弃
@@ -110,6 +122,42 @@ class VLXSeekVLLMWorker:
             raise ValueError(f"Unsupported mm_bbox_order_mode: {order_mode}")
         ordered = sorted(enumerate(boxes), key=sort_key)
         return [box for _, box in ordered], [original_index for original_index, _ in ordered]
+
+    def _letterbox(
+        self, image: Image.Image, boxes: Optional[list[list[float]]]
+    ) -> tuple[Image.Image, Optional[list[list[float]]], float, int, int]:
+        """按 self.letterbox_size 对图 + boxes 做 letterbox（与 VLXSeekWorker 一致）。"""
+        if self.letterbox_size <= 0 or max(image.size) <= self.letterbox_size:
+            return image, boxes, 1.0, 0, 0
+        lb_image, scale, offset_x, offset_y = letterbox_image(image, self.letterbox_size)
+        if boxes:
+            boxes = scale_boxes(boxes, scale, offset_x, offset_y)
+        return lb_image, boxes, scale, offset_x, offset_y
+
+    @staticmethod
+    def _unletterbox_results(
+        result_bbox_list: list[dict],
+        scale: float,
+        offset_x: int,
+        offset_y: int,
+        orig_w: int,
+        orig_h: int,
+    ) -> list[dict]:
+        """把 letterbox 空间的 result_bbox_list 还原到原图坐标（与 VLXSeekWorker 一致）。"""
+        if scale == 1.0 and offset_x == 0 and offset_y == 0:
+            return result_bbox_list
+        restored = []
+        for rb in result_bbox_list:
+            x1 = (rb["xmin"] - offset_x) / scale
+            y1 = (rb["ymin"] - offset_y) / scale
+            x2 = (rb["xmax"] - offset_x) / scale
+            y2 = (rb["ymax"] - offset_y) / scale
+            x1, x2 = sorted((max(0.0, min(x1, orig_w)), max(0.0, min(x2, orig_w))))
+            y1, y2 = sorted((max(0.0, min(y1, orig_h)), max(0.0, min(y2, orig_h))))
+            rb = dict(rb)
+            rb.update(xmin=x1, ymin=y1, xmax=x2, ymax=y2)
+            restored.append(rb)
+        return restored
 
     def _build_prompt(self, question: str, boxes) -> str:
         """vLLM 版 prompt：<image> 用 <|image_pad|>（vLLM processor 自动展开）。"""
@@ -195,7 +243,9 @@ class VLXSeekVLLMWorker:
     ) -> dict:
         """Answer one image question, optionally using object-region prompts."""
         image = image.convert("RGB")
+        orig_w, orig_h = image.size
         caller_boxes = VLXSeekWorker._validate_boxes(bbox_list, image)
+        image, caller_boxes, scale, offset_x, offset_y = self._letterbox(image, caller_boxes)
         boxes, sorted_to_original = self._order_boxes(caller_boxes)
         question = VLXSeekWorker._remap_prompt_object_tokens(
             question, sorted_to_original
@@ -209,6 +259,9 @@ class VLXSeekVLLMWorker:
         answer = self._decode_answer(out)
         answer = VLXSeekWorker._remap_object_tokens(answer, sorted_to_original)
         result_bbox_list = VLXSeekWorker._build_result_bbox_list(answer, caller_boxes)
+        result_bbox_list = self._unletterbox_results(
+            result_bbox_list, scale, offset_x, offset_y, orig_w, orig_h
+        )
         return {
             "answer": answer,
             "result_bbox_list": result_bbox_list,
@@ -224,7 +277,7 @@ class VLXSeekVLLMWorker:
     ) -> list[dict]:
         """批量提交（一次 llm.generate），返回与 predict 相同格式的 list。"""
         vllm_requests: list[dict] = []
-        metas: list[tuple[list[int], list[list[float]]]] = []
+        metas: list[tuple[list[int], list[list[float]], float, int, int, int, int]] = []
         for request in requests:
             if isinstance(request, dict):
                 image = request["image"]
@@ -234,14 +287,16 @@ class VLXSeekVLLMWorker:
                 image, question = request
                 boxes = None
             image = image.convert("RGB")
+            orig_w, orig_h = image.size
             caller_boxes = VLXSeekWorker._validate_boxes(boxes, image)
+            image, caller_boxes, scale, offset_x, offset_y = self._letterbox(image, caller_boxes)
             ordered_boxes, sorted_to_original = self._order_boxes(caller_boxes)
             question = VLXSeekWorker._remap_prompt_object_tokens(
                 question, sorted_to_original
             )
             prompt = self._build_prompt(question, ordered_boxes)
             vllm_requests.append(self._make_request(image, ordered_boxes, prompt))
-            metas.append((sorted_to_original, caller_boxes))
+            metas.append((sorted_to_original, caller_boxes, scale, offset_x, offset_y, orig_w, orig_h))
 
         outs, elapsed = self._run_generate(
             vllm_requests,
@@ -251,14 +306,20 @@ class VLXSeekVLLMWorker:
             kwargs.get("repetition_penalty", 1.0),
         )
         results = []
-        for out, (sorted_to_original, caller_boxes) in zip(outs, metas):
+        for out, meta in zip(outs, metas):
+            sorted_to_original, caller_boxes, scale, offset_x, offset_y, orig_w, orig_h = meta
             answer = self._decode_answer(out)
             answer = VLXSeekWorker._remap_object_tokens(answer, sorted_to_original)
             results.append(
                 {
                     "answer": answer,
-                    "result_bbox_list": VLXSeekWorker._build_result_bbox_list(
-                        answer, caller_boxes
+                    "result_bbox_list": self._unletterbox_results(
+                        VLXSeekWorker._build_result_bbox_list(answer, caller_boxes),
+                        scale,
+                        offset_x,
+                        offset_y,
+                        orig_w,
+                        orig_h,
                     ),
                     "prompt_tokens": len(out.prompt_token_ids),
                     "completion_tokens": len(out.outputs[0].token_ids),
@@ -317,7 +378,9 @@ class VLXSeekVLLMWorker:
             与 detect() 相同格式的 dict，result_bbox_list 为所有批次的并集。
         """
         image = image.convert("RGB")
+        orig_w, orig_h = image.size
         caller_boxes = VLXSeekWorker._validate_boxes(bbox_list, image)
+        image, caller_boxes, scale, offset_x, offset_y = self._letterbox(image, caller_boxes)
         boxes, sorted_to_original = self._order_boxes(caller_boxes)
 
         lang = kwargs.get("lang", "en")
@@ -352,6 +415,9 @@ class VLXSeekVLLMWorker:
                 merged["answer"] += answer + "\n"
             merged["prompt_tokens"] += len(out.prompt_token_ids)
             merged["completion_tokens"] += len(out.outputs[0].token_ids)
+        merged["result_bbox_list"] = self._unletterbox_results(
+            merged["result_bbox_list"], scale, offset_x, offset_y, orig_w, orig_h
+        )
         return merged
 
     def ground(

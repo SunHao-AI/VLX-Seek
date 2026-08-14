@@ -182,6 +182,44 @@ python inference.py \
 
 检测结果默认以 JSON 打印，并可视化保存到 `<image_stem>_result.png`。所有任务、自定义 proposals、生成参数、输出字段和 Python API 请参阅**[完整推理指南](docs/inference_zh.md)**。
 
+## 蒸馏数据生成（伪标签）
+
+`distill/generate_pseudo_labels.py` 用 VLX-Seek 批量生成 COCO 格式伪标签，用于蒸馏训练 YOLO-World 等轻量检测器。流程：WeDetect 生成候选区域 → VLX-Seek 开放词汇检测 → 过滤合并为 COCO JSON。类别 prompt 可由 `distill/generate_prompts.py` 生成（输出含 `prompt_to_category` 反向映射，供 COCO `categories.name` 还原为真实中文类别名）。
+
+### 推荐运行脚本（vLLM 多卡）
+
+在 8×RTX 5880 Ada(48GB) 服务器、`.venv-vllm` 环境运行：
+
+```bash
+# 大图滑窗裁剪（2500×2500）减少切片数；裁剪块进 VLX-Seek 前先按
+# --letterbox-size 缩放+补边，显著控制视觉塔显存；WeDetect 仍在原分辨率上提 proposals。
+.venv-vllm/Scripts/python distill/generate_pseudo_labels.py \
+  --image-dir distill/data/images \
+  --categories "人群密集; 道路施工区域或施工场景; 水面浑浊、不洁的水体; 头盔" \
+  --output distill/data/pseudo_labels.json \
+  --model-path resources/VLX-Seek-1.5-10B \
+  --backend vllm \
+  --prompt-batch-size 50 \
+  --gpu-ids "0,1,2,3,4,5,6,7" \
+  --slice-width 2500 --slice-height 2500 \
+  --letterbox-size 1024 \
+  --max-new-tokens 1024 \
+  --resume
+```
+
+### 关键参数说明
+
+| 参数 | 推荐值 | 说明 |
+| --- | --- | --- |
+| `--backend vllm` | - | vLLM 引擎常驻，同裁剪块多类别批次共享图像 + object 前缀 KV（prefix caching） |
+| `--gpu-ids` | `0,1,2,3,4,5,6,7` | 多卡并行，图像按轮询分片，各卡独立写 shard 文件 |
+| `--slice-width / --slice-height` | `2500` | 滑窗裁剪块尺寸。大裁剪块减少切片数，配合 letterbox 控制显存；小目标多的场景可调小 |
+| `--letterbox-size` | `1024` | VLX 推理前 letterbox 的长边目标（默认 1024，`0` 关闭）。大图（>1024）先缩放 + 居中补灰边，bbox 同步变换、结果自动还原。显存紧张调小（896/768），需更细细节调大（1536/2048） |
+| `--prompt-batch-size` | `50` | 每 50 个类别一组循环推理，控制单请求 prompt 长度 |
+| `--max-proposals` | `100` | 每裁剪块保留的候选框数（已按分数降序），调小可缩短 prompt 和解码 |
+| `--max-new-tokens` | `1024` | 解码长度上限，避免大裁剪块下输出被截断 |
+| `--resume` | - | 断点续跑，跳过输出中已存在的图像 |
+
 ## 问题设定
 
 具身和端侧视觉系统需要稳定的空间锚点。机器人、无人机、摄像头、移动设备和巡检系统往往不仅需要知道“画面里有什么”，还需要知道：

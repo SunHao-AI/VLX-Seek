@@ -35,6 +35,60 @@ from vlx_seek.models.vlx_seek_1_5.mm_utils import (
 from vlx_seek.task_templates import build_prompt
 
 
+def letterbox_image(
+    image: Image.Image, target_size: int, fill: int = 114
+) -> tuple[Image.Image, float, int, int]:
+    """Letterbox 图片：长边缩放到 target_size，保持宽高比并居中补灰边。
+
+    仅当 max(w, h) > target_size 时缩放（小图不放大）；返回
+    (缩放后图片, scale, offset_x, offset_y)。
+    """
+    width, height = image.size
+    if max(width, height) <= target_size:
+        return image, 1.0, 0, 0
+    scale = target_size / max(width, height)
+    new_w = max(1, round(width * scale))
+    new_h = max(1, round(height * scale))
+    resized = image.resize((new_w, new_h), Image.BILINEAR)
+    canvas = Image.new("RGB", (target_size, target_size), (fill, fill, fill))
+    offset_x = (target_size - new_w) // 2
+    offset_y = (target_size - new_h) // 2
+    canvas.paste(resized, (offset_x, offset_y))
+    return canvas, scale, offset_x, offset_y
+
+
+def scale_boxes(
+    boxes: list[list[float]], scale: float, offset_x: int, offset_y: int
+) -> list[list[float]]:
+    """把 boxes 从原图坐标变换到 letterbox 坐标。"""
+    return [
+        [
+            x1 * scale + offset_x,
+            y1 * scale + offset_y,
+            x2 * scale + offset_x,
+            y2 * scale + offset_y,
+        ]
+        for x1, y1, x2, y2 in boxes
+    ]
+
+
+def unscale_boxes(
+    boxes: list[list[float]], scale: float, offset_x: int, offset_y: int
+) -> list[list[float]]:
+    """把 boxes 从 letterbox 坐标还原到原图坐标（scale=1/offset=0 时原样返回）。"""
+    if scale == 1.0 and offset_x == 0 and offset_y == 0:
+        return boxes
+    return [
+        [
+            (x1 - offset_x) / scale,
+            (y1 - offset_y) / scale,
+            (x2 - offset_x) / scale,
+            (y2 - offset_y) / scale,
+        ]
+        for x1, y1, x2, y2 in boxes
+    ]
+
+
 class VLXSeekWorker:
     """Stateful VLX-Seek 1.5 inference worker.
 
@@ -43,7 +97,7 @@ class VLXSeekWorker:
     auxiliary visual-prompt encoder and is required by region-level tasks.
     """
 
-    def __init__(self, model_path: str, device: str = "cuda"):
+    def __init__(self, model_path: str, device: str = "cuda", letterbox_size: int = 0):
         self.device = torch.device(device)
         self.tokenizer, self.model, image_processors = load_pretrained_model(
             model_path, device=device
@@ -52,6 +106,51 @@ class VLXSeekWorker:
         self.model.eval()
         self._cached_inputs = None  # (images, image_grid_thws, images_aux)，与模型图片缓存配套
         self.log_timing = False     # True 时每次 generate 输出耗时日志
+        # 推理前 letterbox 的长边目标尺寸（像素）。大图（如 2500×2500 裁剪块）
+        # 直接进入视觉塔会显著抬高显存：aux C-RADIOv4 的 CLIP processor 不缩放，
+        # 会按原生分辨率计算 4 层特征图。>0 时对超尺寸图先缩放+居中补边，bbox 同步
+        # 变换，结果还原回原图坐标，接口对外不可见。0 表示关闭（原行为）。
+        self.letterbox_size = letterbox_size
+
+    def _letterbox(
+        self, image: Image.Image, boxes: Optional[list[list[float]]]
+    ) -> tuple[Image.Image, Optional[list[list[float]]], float, int, int]:
+        """按 self.letterbox_size 对图 + boxes 做 letterbox。
+
+        返回 (缩放后图片, letterbox 空间 boxes, scale, offset_x, offset_y)。
+        未启用或图长边不超过目标时原样返回（scale=1, offset=0）。
+        """
+        if self.letterbox_size <= 0 or max(image.size) <= self.letterbox_size:
+            return image, boxes, 1.0, 0, 0
+        lb_image, scale, offset_x, offset_y = letterbox_image(image, self.letterbox_size)
+        if boxes:
+            boxes = scale_boxes(boxes, scale, offset_x, offset_y)
+        return lb_image, boxes, scale, offset_x, offset_y
+
+    @staticmethod
+    def _unletterbox_results(
+        result_bbox_list: list[dict],
+        scale: float,
+        offset_x: int,
+        offset_y: int,
+        orig_w: int,
+        orig_h: int,
+    ) -> list[dict]:
+        """把 letterbox 空间的 result_bbox_list 还原到原图坐标并裁剪回图像边界。"""
+        if scale == 1.0 and offset_x == 0 and offset_y == 0:
+            return result_bbox_list
+        restored = []
+        for rb in result_bbox_list:
+            x1 = (rb["xmin"] - offset_x) / scale
+            y1 = (rb["ymin"] - offset_y) / scale
+            x2 = (rb["xmax"] - offset_x) / scale
+            y2 = (rb["ymax"] - offset_y) / scale
+            x1, x2 = sorted((max(0.0, min(x1, orig_w)), max(0.0, min(x2, orig_w))))
+            y1, y2 = sorted((max(0.0, min(y1, orig_h)), max(0.0, min(y2, orig_h))))
+            rb = dict(rb)
+            rb.update(xmin=x1, ymin=y1, xmax=x2, ymax=y2)
+            restored.append(rb)
+        return restored
 
     @staticmethod
     def _validate_boxes(
@@ -219,7 +318,9 @@ class VLXSeekWorker:
             必须与缓存时完全一致。
         """
         image = image.convert("RGB")
+        orig_w, orig_h = image.size
         caller_boxes = self._validate_boxes(bbox_list, image)
+        image, caller_boxes, scale, offset_x, offset_y = self._letterbox(image, caller_boxes)
         boxes, sorted_to_original = self._order_boxes(caller_boxes)
         question = self._remap_prompt_object_tokens(question, sorted_to_original)
         prompt = self._build_prompt(question, boxes)
@@ -277,6 +378,9 @@ class VLXSeekWorker:
         answer = answer.replace("<|im_end|>", "").strip()
         answer = self._remap_object_tokens(answer, sorted_to_original)
         result_bbox_list = self._build_result_bbox_list(answer, caller_boxes)
+        result_bbox_list = self._unletterbox_results(
+            result_bbox_list, scale, offset_x, offset_y, orig_w, orig_h
+        )
         return {
             "answer": answer,
             "result_bbox_list": result_bbox_list,
@@ -344,6 +448,7 @@ class VLXSeekWorker:
         """
         image = image.convert("RGB")
         caller_boxes = self._validate_boxes(boxes, image)
+        image, caller_boxes, _, _, _ = self._letterbox(image, caller_boxes)
         ordered_boxes, _ = self._order_boxes(caller_boxes)
 
         images, image_grid_thws, images_aux = self._prepare_image_inputs(

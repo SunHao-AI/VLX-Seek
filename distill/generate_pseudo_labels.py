@@ -32,6 +32,10 @@
     做滑窗裁剪（默认 1000x1000，重叠 10%），对每个裁剪块分别跑 WeDetect +
     VLX-Seek，再合并回原图坐标。适合大图小目标场景。可用 --slice-width /
     --slice-height / --overlap-width-ratio / --overlap-height-ratio 调整。
+    大裁剪块（如 --slice-width 2500）进入 VLX-Seek 前会先按 --letterbox-size
+    （默认 1024）做 letterbox：长边缩放、居中补灰边，bbox 同步变换、结果自动
+    还原回裁剪块坐标，显著降低视觉塔显存占用；WeDetect 仍在原分辨率裁剪块上
+    提取 proposals，保证小目标召回。
 
 类别名还原说明：
     --categories 传入的是推理 prompt（可能与真实中文类别名不同）。若
@@ -133,6 +137,15 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=100,
         help="WeDetect 每个裁剪块保留的最大候选框数（proposals 已按分数降序）。调小可缩短 prompt 和解码。",
+    )
+    parser.add_argument(
+        "--letterbox-size",
+        type=int,
+        default=1024,
+        help="VLX-Seek 推理前对裁剪图/原图做 letterbox 的长边目标尺寸（像素）。"
+        "大图（如 2500×2500 裁剪块）直接进入视觉塔会显著抬高显存（aux C-RADIOv4 "
+        "不缩放、按原生分辨率提取 4 层特征图）；letterbox 后长边缩放、居中补灰边，"
+        "bbox 同步变换、结果自动还原回原图坐标。0 表示关闭。",
     )
     parser.add_argument(
         "--log-timing",
@@ -365,14 +378,17 @@ def run_pipeline(args: argparse.Namespace, image_paths: list[Path] | None = None
         worker = VLXSeekVLLMWorker(
             args.model_path,
             device=args.device,
-            gpu_memory_utilization=0.7,
+            gpu_memory_utilization=0.85,
             tensor_parallel_size=1,
             max_model_len=8192,
+            letterbox_size=args.letterbox_size,
         )
     else:
         from vlx_seek_worker import VLXSeekWorker
 
-        worker = VLXSeekWorker(args.model_path, device=args.device)
+        worker = VLXSeekWorker(
+            args.model_path, device=args.device, letterbox_size=args.letterbox_size
+        )
 
     worker.log_timing = args.log_timing
 
