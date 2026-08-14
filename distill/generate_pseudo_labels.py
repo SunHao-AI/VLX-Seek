@@ -80,8 +80,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--prompt-map",
         default=str(Path(__file__).resolve().parent / "data" / "category_prompts.json"),
-        help="类别 prompt 映射文件（generate_prompts.py 输出）。用于把 COCO categories.name"
-        " 从推理 prompt 还原为真实中文类别名；文件不存在或缺少 prompt_to_category 时保持原样。",
+        help="类别 prompt 映射文件（generate_prompts.py 输出）。用于把 COCO categories.name" " 从推理 prompt 还原为真实中文类别名；文件不存在或缺少 prompt_to_category 时保持原样。",
     )
     parser.add_argument("--model-path", default="resources/VLX-Seek-1.5-10B")
     parser.add_argument(
@@ -94,8 +93,7 @@ def parse_args() -> argparse.Namespace:
         "--backend",
         choices=("hf", "vllm"),
         default="hf",
-        help="推理后端：hf=HF 原始路径（默认，行为零变化）；vllm=vLLM 引擎"
-        "（需在 .venv-vllm 环境运行，批量共享前缀 KV 加速）。",
+        help="推理后端：hf=HF 原始路径（默认，行为零变化）；vllm=vLLM 引擎" "（需在 .venv-vllm 环境运行，批量共享前缀 KV 加速）。",
     )
     parser.add_argument("--lang", choices=("en", "zh"), default="en")
     parser.add_argument("--max-new-tokens", type=int, default=1024)
@@ -213,24 +211,44 @@ def detect_with_crop(
     from cv_utils.inference import CropImage
 
     generator = get_wedetect_generator(args.detector_checkpoint)
+    use_batch = args.prompt_batch_size > 0 and len(categories) > args.prompt_batch_size
+    # vLLM 后端两阶段化：阶段 1 先对所有切片跑 WeDetect 收集 proposals，
+    # 阶段 2 再逐个切片推理（每切片一次 generate）。避免 WeDetect（快）与
+    # VLX-Seek（慢）在 GPU 上交替等待，让 LLM 推理连续执行。
+    precollect = args.backend == "vllm"
+    proposals_by_slice: list[list[list[float]]] = []
 
     def callback(slices) -> None:
-        for slc in slices:
+        nonlocal proposals_by_slice
+        if precollect:
+            proposals_by_slice = [_truncate_proposals(generator(slc.image), args.max_proposals) for slc in slices]
+        for idx, slc in enumerate(slices):
             crop = slc.image
             try:
-                boxes = _truncate_proposals(generator(crop), args.max_proposals)
-                if args.prompt_batch_size > 0 and len(categories) > args.prompt_batch_size:
+                boxes = proposals_by_slice[idx] if precollect else _truncate_proposals(generator(crop), args.max_proposals)
+                if use_batch:
                     category_batches = _split_categories(categories, args.prompt_batch_size)
-                    worker.encode_image_cache(crop, boxes)
-                    result = worker.detect_multi_prompt(
-                        crop,
-                        boxes,
-                        category_batches,
-                        lang=args.lang,
-                        max_new_tokens=args.max_new_tokens,
-                        temperature=args.temperature,
-                    )
-                    worker.clear_image_cache()
+                    if precollect:
+                        # vLLM 下 encode_image_cache/clear_image_cache 为 no-op，跳过
+                        result = worker.detect_multi_prompt(
+                            crop,
+                            boxes,
+                            category_batches,
+                            lang=args.lang,
+                            max_new_tokens=args.max_new_tokens,
+                            temperature=args.temperature,
+                        )
+                    else:
+                        worker.encode_image_cache(crop, boxes)
+                        result = worker.detect_multi_prompt(
+                            crop,
+                            boxes,
+                            category_batches,
+                            lang=args.lang,
+                            max_new_tokens=args.max_new_tokens,
+                            temperature=args.temperature,
+                        )
+                        worker.clear_image_cache()
                 else:
                     result = worker.detect(
                         crop,
@@ -242,7 +260,8 @@ def detect_with_crop(
                     )
             except Exception as exc:  # 单个裁剪块失败不中断整体
                 print(f"裁剪推理失败: {exc}", file=sys.stderr)
-                worker.clear_image_cache()
+                if not precollect:
+                    worker.clear_image_cache()
                 continue
 
             shapes = []
