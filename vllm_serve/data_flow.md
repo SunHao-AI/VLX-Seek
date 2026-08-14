@@ -13,6 +13,7 @@
 | [vlx_seek_vlm.py](./vlx_seek_vlm.py) | 自定义多模态模型 `VLXSeek1_5ForCausalLM`（Qwen3.5 主干 + VLX-Seek 视觉栈）+ 自定义 `VLXSeekMultiModalProcessor` |
 | [vlx_seek_vllm_worker.py](./vlx_seek_vllm_worker.py) | 推理 worker：`detect / detect_multi_prompt / predict / ground / count` 等，与 HF `VLXSeekWorker` 同接口 |
 | [bench_prefix_cache.py](./bench_prefix_cache.py) | prefix caching 命中基准：同图同 objects、不同类别后缀的批量请求 |
+| [vllm_vs_hf.md](./vllm_vs_hf.md) | vLLM 后端实现功能、与 HF 的区别、优缺点对比 |
 | `test_*.py` | 冒烟 / 一致性 / 诊断脚本 |
 
 核心收益（相对 HF 串行推理）：
@@ -39,7 +40,9 @@ flowchart TD
 
     MERGE --> SCAT["vLLM _merge_multimodal_embeddings<br/>按 is_multimodal 掩码 scatter 到序列"]
     SCAT --> LM["语言主干 language_model<br/>自回归生成"]
-    LM --> OUT["输出文本 → 后处理<br/>_remap_object_tokens / result_bbox_list"]
+    LM --> OUT["输出 token_ids<br/>（以 &lt;|im_end|&gt; 为 stop）"]
+    OUT --> DEC["_decode_answer<br/>token_ids → 文本<br/>skip_special_tokens=False<br/>（保留 &lt;ground&gt;/&lt;objN&gt;）"]
+    DEC --> POST["后处理<br/>_remap_object_tokens / result_bbox_list"]
 ```
 
 ---
@@ -108,16 +111,42 @@ aux_processor = CLIPImageProcessor(
 
 | 占位符 | token id | 行为 |
 | --- | --- | --- |
-| `<|image_pad|>` | 248056 | 基类展开为 **图像实际 token 数** 个 pad token（数量由 profile run 的 dummy inputs 决定） |
-| `<objfeat>` | 248181 | 自定义 `PromptReplacement`：**1:1** 替换为单 token，并标记为 `modality="image"` 进入 is_multimodal 掩码 |
+| `<|image_pad|>` | 248056 | 展开为 **图像实际 token 数** 个 pad token（数量 = `grid_thw.prod() // merge²`） |
+| `<|vision_end|>` | — | 保留在序列末尾（vision 段闭合符） |
+| `\n` + `<objN>` | 各单 token | 逐框 `<objN>` 后紧跟一个 `<objfeat>` |
+| `<objfeat>` | 248181 | 单 token，经 `is_embed` 掩码标记 → 进入 is_multimodal 掩码 |
+
+**实现要点（vLLM 0.17 行为约束）**：vLLM 0.17 对同一 item 的多个 prompt updates
+只应用第一个（`_find_matches` 中 `"Already found a match for this item"` 直接 break），
+因此**不能**在基类 image replacement 之外再追加独立的 `<objfeat>` replacement——
+那样 248181 永远不进掩码，对象嵌入会在 `_merge_multimodal_embeddings` 的
+`masked_scatter_` 中被静默丢弃（输出发散为 `'小汽车None'`）。
+
+正确做法是「**单个合并 replacement**」：移除基类的 image update，把 image_pad 段 +
+objfeat 行合并为一个 target，replacement 用 `PromptUpdateDetails.select_token_ids`
+同时标记图像 token 与 `<objfeat>` 位置：
 
 ```python
-updates.append(PromptReplacement(
-    modality="image",
-    target="<objfeat>",
-    replacement=[_OBJFEAT_TOKEN_ID],   # 248181
-))
+# target（文本形式，不含 <|vision_start|>）：失败时自动回退字符串匹配
+if n_boxes == 0:
+    target = "<|image_pad|><|vision_end|>"
+else:
+    target = "<|image_pad|><|vision_end|>\n" + "".join(
+        f"<obj{i}><objfeat>" for i in range(n_boxes)
+    )
+
+# replacement：展开后的 token 序列 + is_embed 掩码
+full = [image_token_id] * num_tokens + [vision_end_id]
+if n_boxes > 0:
+    full.append(newline_id)
+    for i in range(n_boxes):
+        full.extend([obj_token_ids[i], _OBJFEAT_TOKEN_ID])
+return PromptUpdateDetails.select_token_ids(full, [image_token_id, _OBJFEAT_TOKEN_ID])
 ```
+
+`n_boxes` 从 `hf_processor_mm_kwargs["bbox_list"]` 推断（`bbox_list.shape[-2]`），
+与 worker `_build_prompt` 的 `<objN>` 行严格一致；dummy/profile 输入
+（`Qwen3VLDummyInputsBuilder`）无 bbox，target 退化为不含 `\n` 的纯 image_pad 段。
 
 ### 4.2 `_call_hf_processor` — 透传自定义字段
 
@@ -199,6 +228,33 @@ vLLM 的 `_merge_multimodal_embeddings` 按 is_multimodal 掩码顺序 scatter�
 
 ---
 
+### 5.4 输出解码与后处理（worker 层）
+
+生成结束后，`CompletionOutput.text` **不能直接使用**：vLLM 默认
+`skip_special_tokens=True`，会把 `<ground>` / `<objN>` 等单 token 标签在
+decode 时静默丢弃，只剩中间类别文本，导致 `_build_result_bbox_list` 解析为空。
+因此 worker 统一走 `_decode_answer()`：
+
+```python
+def _decode_answer(self, out) -> str:
+    text = self.tokenizer.decode(
+        out.outputs[0].token_ids, skip_special_tokens=False
+    )
+    return text.replace("<|im_end|>", "").strip()
+```
+
+与 HF 端（`tokenizer.decode(ids, skip_special_tokens=False)` +
+`replace("<|im_end|>", "")`）行为完全一致。之后流程与 HF 相同：
+
+1. `_remap_object_tokens(answer, sorted_to_original)`：把输出里的 `<objN>` 映射回调用方原始框索引；
+2. `_build_result_bbox_list(answer, caller_boxes)`：解析 `<ground>类别</ground><objects><objN>...</objects>`
+   结构，输出 `result_bbox_list`。
+
+> 注意：生成停止由 `SamplingParams.stop=["<|im_end|>"]` 负责（vLLM 侧），
+> token_ids 中不含 `<|im_end|>`；`_decode_answer` 里的 replace 仅兜底。
+
+---
+
 ## 6. 权重加载与模型注册
 
 ```mermaid
@@ -243,7 +299,10 @@ flowchart LR
 | 请求构建 / prompt 模板 | [vlx_seek_vllm_worker.py](./vlx_seek_vllm_worker.py) `_build_prompt` / `_make_request` |
 | 占位符替换 / 字段透传 | [vlx_seek_vlm.py](./vlx_seek_vlm.py) `VLXSeekMultiModalProcessor` |
 | 双通道编码 / 嵌入合并 | [vlx_seek_vlm.py](./vlx_seek_vlm.py) `embed_multimodal` / `_process_image_and_object` / `_process_object_input` |
+| 输出解码 / 停止条件 | [vlx_seek_vllm_worker.py](./vlx_seek_vllm_worker.py) `_decode_answer` / `_run_generate`（`SamplingParams.stop`） |
 | object 特征提取 | [hybrid_finegrained_region_encoder.py](../vlx_seek/models/vlx_seek_1_5/multimodal_visual_prompt_encoder/hybrid_finegrained_region_encoder.py) `HybridFineGrainedRegionEncoder` |
 | 主视觉塔 | [qwen3_5_vl_encoder.py](../vlx_seek/models/vlx_seek_1_5/multimodal_encoder/qwen3_5_vl_encoder.py) `Qwen3_5_VlVisionTower` |
 | aux 视觉塔 | [c_radio_v4_aux_encoder.py](../vlx_seek/models/vlx_seek_1_5/multimodal_encoder/c_radio_v4_aux_encoder.py) `CRadioV4AuxEncoder` |
 | 插件注册 | [plugin.py](./plugin.py) `init()` |
+| 一致性回归 | [test_consistency.py](./test_consistency.py) |
+| 与 HF 对比 / 优缺点 | [vllm_vs_hf.md](./vllm_vs_hf.md) |

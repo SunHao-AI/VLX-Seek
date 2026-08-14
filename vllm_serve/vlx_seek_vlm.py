@@ -16,19 +16,11 @@
 """
 from __future__ import annotations
 
-import os
 from typing import Iterable, Optional, Set
 
 import torch
 
 from transformers import AutoConfig
-
-_VLX_DEBUG = os.environ.get("VLX_DEBUG") == "1"
-
-
-def _dbg(*args) -> None:
-    if _VLX_DEBUG:
-        print("[VLX-DEBUG]", *args, flush=True)
 
 from vllm.config import VllmConfig
 # 必须继承 vLLM 自己的 Qwen3_5Config（vllm.transformers_utils.configs.qwen3_5），
@@ -136,10 +128,6 @@ class VLXSeekMultiModalProcessor(Qwen3VLMultiModalProcessor):
         updates = list(super()._get_prompt_updates(
             mm_items, hf_processor_mm_kwargs, out_mm_kwargs
         ))
-        _dbg(
-            "[_get_prompt_updates] base updates:",
-            [(u.modality, getattr(u, "target", None)) for u in updates],
-        )
         # 移除基类的 image replacement：vLLM 0.17 对同一 item 的多个 prompt updates
         # 只应用第一个（_find_matches 中 "Already found a match for this item" 直接
         # break），追加独立的 <objfeat> replacement 永远不会生效，导致 248181 不进
@@ -171,15 +159,6 @@ class VLXSeekMultiModalProcessor(Qwen3VLMultiModalProcessor):
                 n_boxes = len(first)
             elif hasattr(first, "shape") and first.ndim >= 1:
                 n_boxes = first.shape[0]
-        _dbg(
-            "[_get_prompt_updates] bbox_list type/shape:",
-            type(bbox_list).__name__,
-            getattr(bbox_list, "shape", None),
-            "n_boxes:",
-            n_boxes,
-            "mm_items:",
-            len(mm_items),
-        )
 
         # <obj0>, <obj1>, ... 为训练时加入词表的特殊 token（应为单 token）
         obj_token_ids = []
@@ -216,14 +195,9 @@ class VLXSeekMultiModalProcessor(Qwen3VLMultiModalProcessor):
 
             # is_embed 掩码：标记图像 token 与 <objfeat>（248181）位置，
             # 与 embed_multimodal 返回的「图像行 + 对象行」顺序一一对应。
-            details = PromptUpdateDetails.select_token_ids(
+            return PromptUpdateDetails.select_token_ids(
                 full, [image_token_id, _OBJFEAT_TOKEN_ID]
             )
-            _dbg(
-                f"[_get_prompt_updates] item {item_idx} num_tokens={num_tokens} "
-                f"full_len={len(full)} embed_mask_sum={int(details.is_embed.sum()) if hasattr(details.is_embed, 'sum') else None}"
-            )
-            return details
 
         updates.append(PromptReplacement(
             modality="image",
@@ -428,13 +402,6 @@ class VLXSeek1_5ForCausalLM(_VllmQwen3_5VLM):
         if not mm_input_by_modality:
             return None
 
-        _dbg("[embed_multimodal] kwargs keys:", list(kwargs.keys()))
-        for modality, inputs in mm_input_by_modality.items():
-            _dbg(
-                f"[embed_multimodal] modality={modality} "
-                f"input_type={type(inputs).__name__}"
-            )
-
         all_embeds: list[torch.Tensor] = []
         for modality in mm_input_by_modality:
             multimodal_input = mm_input_by_modality[modality]
@@ -447,10 +414,6 @@ class VLXSeek1_5ForCausalLM(_VllmQwen3_5VLM):
         # 返回 tuple（元素数 = mm item 数），每个元素是单个 tensor：
         # 图像 token + object token 合并。sanity_check_mm_encoder_outputs 校验
         # len(mm_embeddings) == expected_num_items（1 个 image item → 1 个元素）。
-        _dbg(
-            "[embed_multimodal] returning rows:",
-            [tuple(t.shape) for t in all_embeds],
-        )
         return (torch.cat(all_embeds, dim=0),)
 
     def _process_image_and_object(self, image_input, kwargs) -> tuple[torch.Tensor, ...]:
@@ -511,31 +474,19 @@ class VLXSeek1_5ForCausalLM(_VllmQwen3_5VLM):
         images_aux = kwargs.get("images_aux")
         bbox_list = kwargs.get("bbox_list")
 
-        _dbg(
-            "[_process_object_input] images_aux:",
-            None if images_aux is None else type(images_aux).__name__,
-            None if images_aux is None else getattr(images_aux, "shape", None),
-            "bbox_list:",
-            None if bbox_list is None else type(bbox_list).__name__,
-            None if bbox_list is None else getattr(bbox_list, "shape", None),
-        )
-
         if images_aux is None or bbox_list is None:
             return None
 
         vision_tower_aux = self.get_vision_tower_aux()
         if vision_tower_aux is None:
-            _dbg("[_process_object_input] vision_tower_aux is None")
             return None
 
         # 检查是否有有效 bbox
         has_bbox = any(b is not None and len(b) > 0 for b in bbox_list)
-        _dbg("[_process_object_input] has_bbox:", has_bbox)
         if not has_bbox:
             return None
 
         if vt_multi_level_features is None:
-            _dbg("[_process_object_input] vt_multi_level_features is None")
             return None
 
         # 计算 vt_images_size（从 grid_thw 推断原图尺寸）
@@ -568,10 +519,6 @@ class VLXSeek1_5ForCausalLM(_VllmQwen3_5VLM):
 
         object_features = self.encode_objects(
             images_aux, bbox_list, vt_multi_level_features, vt_images_size
-        )
-        _dbg(
-            "[_process_object_input] object_features:",
-            None if object_features is None else [tuple(f.shape) for f in object_features],
         )
         return object_features
 
