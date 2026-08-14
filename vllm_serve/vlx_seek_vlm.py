@@ -429,8 +429,11 @@ class VLXSeek1_5ForCausalLM(_VllmQwen3_5VLM):
             return None
 
         _dbg("[embed_multimodal] kwargs keys:", list(kwargs.keys()))
-        for modality, items in mm_input_by_modality.items():
-            _dbg(f"[embed_multimodal] modality={modality} items={len(items)}")
+        for modality, inputs in mm_input_by_modality.items():
+            _dbg(
+                f"[embed_multimodal] modality={modality} "
+                f"input_type={type(inputs).__name__}"
+            )
 
         all_embeds: list[torch.Tensor] = []
         for modality in mm_input_by_modality:
