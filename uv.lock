@@ -1472,7 +1472,7 @@ wheels = [
 [[package]]
 name = "vlx-seek"
 version = "1.5.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "accelerate" },
     { name = "cv-utils" },
@@ -1493,23 +1493,31 @@ distill = [
 flash-attn = [
     { name = "flash-attn" },
 ]
+vllm-gpu = [
+    { name = "einops" },
+    { name = "timm" },
+    { name = "torchvision" },
+]
 
 [package.metadata]
 requires-dist = [
     { name = "accelerate", specifier = "==1.4.0" },
     { name = "cv-utils", git = "https://gitee.com/SunHao-AI/cv_utils.git" },
     { name = "einops", specifier = "==0.6.1" },
+    { name = "einops", marker = "extra == 'vllm-gpu'", specifier = "==0.6.1" },
     { name = "flash-attn", marker = "extra == 'flash-attn'", specifier = "==2.8.3" },
     { name = "gradio" },
     { name = "pillow" },
     { name = "requests" },
     { name = "timm", specifier = "==1.0.9" },
+    { name = "timm", marker = "extra == 'vllm-gpu'", specifier = "==1.0.9" },
     { name = "torch", specifier = "==2.10.0" },
     { name = "torchvision", specifier = "==0.25.0" },
+    { name = "torchvision", marker = "extra == 'vllm-gpu'", specifier = "==0.25.0" },
     { name = "transformers", specifier = "==5.13.0" },
     { name = "ultralytics", marker = "extra == 'distill'" },
 ]
-provides-extras = ["flash-attn", "distill"]
+provides-extras = ["flash-attn", "distill", "vllm-gpu"]
 
 [[package]]
 name = "watchdog"

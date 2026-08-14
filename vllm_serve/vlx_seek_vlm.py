@@ -40,7 +40,7 @@ from vllm.model_executor.models.qwen3_vl import (
 from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import MultiModalFieldConfig
-from vllm.multimodal.processing import PromptReplacement
+from vllm.multimodal.processing import PromptReplacement, PromptUpdateDetails
 
 # 项目视觉栈（属性名与 HF modeling 保持一致）
 from vlx_seek.models.vlx_seek_1_5.multimodal_encoder.builder import (
@@ -128,11 +128,81 @@ class VLXSeekMultiModalProcessor(Qwen3VLMultiModalProcessor):
         updates = list(super()._get_prompt_updates(
             mm_items, hf_processor_mm_kwargs, out_mm_kwargs
         ))
-        # <objfeat> 1:1 替换（不展开，每个 bbox 一个 token）
+        # 移除基类的 image replacement：vLLM 0.17 对同一 item 的多个 prompt updates
+        # 只应用第一个（_find_matches 中 "Already found a match for this item" 直接
+        # break），追加独立的 <objfeat> replacement 永远不会生效，导致 248181 不进
+        # is_multimodal 掩码、对象嵌入在 _merge_multimodal_embeddings 的
+        # masked_scatter_ 中被静默丢弃（输出发散为 '小汽车None'）。
+        # 这里改为「单个合并 replacement」：target 覆盖 image_pad 段 + objfeat 行，
+        # replacement 用 PromptUpdateDetails.is_embed 同时标记图像与 <objfeat> 位置。
+        updates = [u for u in updates if u.modality != "image"]
+
+        hf_config = self.info.get_hf_config()
+        tokenizer = self.info.get_tokenizer()
+        hf_processor = self.info.get_hf_processor(**hf_processor_mm_kwargs)
+        image_processor = self.info.get_image_processor(**hf_processor_mm_kwargs)
+        merge_length = image_processor.merge_size ** 2
+
+        image_token_id = hf_processor.image_token_id
+        vision_end_id = hf_config.vision_end_token_id
+        newline_tokens = tokenizer.encode("\n", add_special_tokens=False)
+        newline_id = newline_tokens[0] if newline_tokens else 198
+
+        # bbox 数量：与 vlx_seek_vllm_worker._build_prompt 的 <objN> 行一致
+        bbox_list = hf_processor_mm_kwargs.get("bbox_list")
+        n_boxes = 0
+        if isinstance(bbox_list, torch.Tensor):
+            n_boxes = bbox_list.shape[-2] if bbox_list.ndim >= 2 else 0
+        elif isinstance(bbox_list, (list, tuple)) and len(bbox_list) > 0:
+            first = bbox_list[0]
+            if isinstance(first, (list, tuple)):
+                n_boxes = len(first)
+            elif hasattr(first, "shape") and first.ndim >= 1:
+                n_boxes = first.shape[0]
+
+        # <obj0>, <obj1>, ... 为训练时加入词表的特殊 token（应为单 token）
+        obj_token_ids = []
+        for i in range(n_boxes):
+            tokens = tokenizer.encode(f"<obj{i}>", add_special_tokens=False)
+            obj_token_ids.append(tokens[0] if tokens else _OBJFEAT_TOKEN_ID)
+
+        def build_target(item_idx: int):
+            # 文本形式 target：image_pad 段 + objfeat 行（与 worker _build_prompt 一致，
+            # 不含 <|vision_start|>）。文本匹配对 <objN> 的分词更宽容，失败时
+            # _apply_prompt_updates 会自动回退到字符串匹配。
+            # 注意 dummy/profile 输入（Qwen3VLDummyInputsBuilder）的 prompt 是
+            # "<|vision_start|><|image_pad|><|vision_end|>"（无 \n、无 objfeat 行），
+            # 故 n_boxes=0 时 target 不含 "\n"，否则会匹配失败。
+            if n_boxes == 0:
+                return "<|image_pad|><|vision_end|>"
+            parts = ["<|image_pad|><|vision_end|>\n"]
+            for i in range(n_boxes):
+                parts.append(f"<obj{i}><objfeat>")
+            return "".join(parts)
+
+        def build_replacement(item_idx: int):
+            # 展开后 token 序列：图像 tokens + vision_end（+\n + obj 行）
+            out_item = out_mm_kwargs["image"][item_idx]
+            grid_thw = out_item["image_grid_thw"].data
+            num_tokens = int(grid_thw.prod()) // merge_length
+
+            full = [image_token_id] * num_tokens
+            full.append(vision_end_id)
+            if n_boxes > 0:
+                full.append(newline_id)
+                for i in range(n_boxes):
+                    full.extend([obj_token_ids[i], _OBJFEAT_TOKEN_ID])
+
+            # is_embed 掩码：标记图像 token 与 <objfeat>（248181）位置，
+            # 与 embed_multimodal 返回的「图像行 + 对象行」顺序一一对应。
+            return PromptUpdateDetails.select_token_ids(
+                full, [image_token_id, _OBJFEAT_TOKEN_ID]
+            )
+
         updates.append(PromptReplacement(
             modality="image",
-            target="<objfeat>",
-            replacement=[_OBJFEAT_TOKEN_ID],
+            target=build_target,
+            replacement=build_replacement,
         ))
         return updates
 
