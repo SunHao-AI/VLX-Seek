@@ -286,5 +286,8 @@ resources/
 # VLX-Seek distill: 示例图片副本与训练产物（避免提交大文件）
 distill/examples/images/
 distill/examples/runs/
+
 *.txt
 .gitignore
+results
+category_prompts.json
