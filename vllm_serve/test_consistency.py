@@ -76,8 +76,13 @@ def main() -> None:
     parser.add_argument(
         "--boxes",
         default=None,
-        help='候选框（原图像素坐标）"x1,y1,x2,y2;x1,y1,x2,y2"，脚本自动等比换算到缩放后坐标'
+        help='候选框（原图像素坐标）"x1,y1,x2,y2;x1,y1,x2,y2"，脚本自动换算到 crop/缩放后坐标'
         "（不传则纯图检测）",
+    )
+    parser.add_argument(
+        "--crop",
+        default=None,
+        help='裁剪区域（原图坐标）"x1,y1,x2,y2"，模拟 distill 的 crop；不传则整图',
     )
     parser.add_argument("--batch-size", type=int, default=0, help="多批类别每批个数，<=0 全部一批")
     parser.add_argument("--lang", choices=("en", "zh"), default="zh")
@@ -94,18 +99,27 @@ def main() -> None:
 
     image = Image.open(args.image).convert("RGB")
     original_size = list(image.size)
+    # --crop：模拟 distill 的 1000×1000 滑窗裁剪（原图坐标）
+    crop_origin = (0.0, 0.0)
+    if args.crop:
+        cx1, cy1, cx2, cy2 = (float(v) for v in args.crop.split(","))
+        image = image.crop((cx1, cy1, cx2, cy2))
+        crop_origin = (cx1, cy1)
+        print(f"[crop] {original_size} -> {list(image.size)} @ origin ({cx1:.0f},{cy1:.0f})")
+    crop_size = list(image.size)
     if args.max_side > 0 and max(image.size) > args.max_side:
         image.thumbnail((args.max_side, args.max_side))
     resized_size = list(image.size)
-    if original_size != resized_size:
-        print(f"[resize] {original_size} -> {resized_size}")
+    if crop_size != resized_size:
+        print(f"[resize] {crop_size} -> {resized_size}")
     boxes = parse_boxes(args.boxes)
-    # --boxes 用原图坐标，等比换算到缩放后坐标（与传给 worker 的图一致）
-    if boxes and original_size != resized_size:
-        scale_x = resized_size[0] / original_size[0]
-        scale_y = resized_size[1] / original_size[1]
+    # --boxes 用原图坐标：先减去 crop 原点，再按 crop→最终图比例换算
+    if boxes and (crop_origin != (0.0, 0.0) or crop_size != resized_size):
+        scale_x = resized_size[0] / crop_size[0]
+        scale_y = resized_size[1] / crop_size[1]
+        cx1, cy1 = crop_origin
         boxes = [
-            [x1 * scale_x, y1 * scale_y, x2 * scale_x, y2 * scale_y]
+            [(x1 - cx1) * scale_x, (y1 - cy1) * scale_y, (x2 - cx1) * scale_x, (y2 - cy1) * scale_y]
             for x1, y1, x2, y2 in boxes
         ]
         print(f"[boxes] scaled -> {boxes}")
@@ -137,6 +151,8 @@ def main() -> None:
         "backend": args.backend,
         "image": args.image,
         "original_size": original_size,
+        "crop_origin": list(crop_origin) if crop_origin != (0.0, 0.0) else None,
+        "crop_size": crop_size,
         "resized_size": resized_size,
         "categories": categories,
         "boxes": boxes,
