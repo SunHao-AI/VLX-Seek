@@ -76,7 +76,8 @@ def main() -> None:
     parser.add_argument(
         "--boxes",
         default=None,
-        help='候选框 "x1,y1,x2,y2;x1,y1,x2,y2"（不传则纯图检测）',
+        help='候选框（原图像素坐标）"x1,y1,x2,y2;x1,y1,x2,y2"，脚本自动等比换算到缩放后坐标'
+        "（不传则纯图检测）",
     )
     parser.add_argument("--batch-size", type=int, default=0, help="多批类别每批个数，<=0 全部一批")
     parser.add_argument("--lang", choices=("en", "zh"), default="zh")
@@ -99,6 +100,15 @@ def main() -> None:
     if original_size != resized_size:
         print(f"[resize] {original_size} -> {resized_size}")
     boxes = parse_boxes(args.boxes)
+    # --boxes 用原图坐标，等比换算到缩放后坐标（与传给 worker 的图一致）
+    if boxes and original_size != resized_size:
+        scale_x = resized_size[0] / original_size[0]
+        scale_y = resized_size[1] / original_size[1]
+        boxes = [
+            [x1 * scale_x, y1 * scale_y, x2 * scale_x, y2 * scale_y]
+            for x1, y1, x2, y2 in boxes
+        ]
+        print(f"[boxes] scaled -> {boxes}")
     categories = [c.strip() for c in args.categories.split(";") if c.strip()]
 
     if args.backend == "hf":
