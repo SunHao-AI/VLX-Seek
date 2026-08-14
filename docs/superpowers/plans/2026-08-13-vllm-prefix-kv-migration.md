@@ -136,6 +136,19 @@ python -m vllm_serve.test_consistency --backend vllm \
   --out results/vllm.json
 ```
 
+**Task 3 Step 3 首次回归结果（2026-08-13，`distill/data/images2/00001428.jpg` 4000×3000 缩至 1024×768）**：
+| 项 | HF（vlx-seek 环境） | vLLM（.venv-vllm） |
+|---|---|---|
+| detect.answer | `<ground>船舶</ground><objects>None</objects>\n<ground>树木</ground><objects>None</objects>\n...` | `船舶None\n树木None\n挖掘机None` |
+| result_bbox_list | `[]` | `[]` |
+| prompt_tokens | 790 | 790 |
+| completion_tokens | 21 | 21 |
+
+**结论与风险**：
+- 语义一致（无目标均 None），但**输出格式不同**：HF 带 `<ground>/<objects>` 标签（模型训练习得），vLLM 平铺 `类别+结果`。prompt token 数/图像 token id（248056）两端一致、采样均贪心 → 输入语义相同，差异源于 **hybrid mamba 内核数值差异**（vLLM 融合内核 vs HF 纯 PyTorch）导致早期 token argmax 翻转、生成路径分歧（caption 简单任务 1b-2 一致、检测格式任务分歧，符合此假设）
+- **风险**：`VLXSeekWorker._build_result_bbox_list` 只解析 `<ground>...</ground><objects>...</objects>`；本次 boxes=null 时无论输出如何均返回 []，**不能证明有目标时解析正确** → 需用"有目标图 + boxes"验证 vLLM 有目标输出格式
+- **待诊断**：① text-only 同 question 两端对比（区分主干数值差异 vs 视觉路径差异）；② 有目标图 + boxes 对比（验证解析）。若 vLLM 有目标输出仍缺标签 → 在 `VLXSeekVLLMWorker.detect*` 内按 categories 做格式归一化兜底（`类别+objN` → `<ground>类别</ground><objects>objN</objects>`）
+
 ## Task 4 待办（2026-08-13）
 
 ## 关键架构决策
