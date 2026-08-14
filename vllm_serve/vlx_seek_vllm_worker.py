@@ -54,6 +54,15 @@ class VLXSeekVLLMWorker:
             max_model_len=max_model_len,
         )
 
+        # vLLM 的 outputs[0].text 默认 skip_special_tokens=True，会丢弃
+        # <ground>/<objN> 等特殊 token，导致 result_bbox_list 解析失败。
+        # 这里保留 tokenizer，手动 decode 生成 token（skip_special_tokens=False）。
+        from transformers import AutoTokenizer
+
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model_path, trust_remote_code=True
+        )
+
         # aux image processor（C-RADIOv4 硬编码配置，与 VLXSeekWorker 一致）
         from transformers import CLIPImageProcessor
 
@@ -158,6 +167,17 @@ class VLXSeekVLLMWorker:
                 )
         return outs, elapsed
 
+    def _decode_answer(self, out) -> str:
+        """手动 decode 生成 token，保留 <ground>/<objN> 等特殊 token。
+
+        vLLM 的 outputs[0].text 默认 skip_special_tokens=True，会丢弃这些
+        单 token 标签，导致 _build_result_bbox_list 解析失败（输出只剩类别名）。
+        """
+        text = self.tokenizer.decode(
+            out.outputs[0].token_ids, skip_special_tokens=False
+        )
+        return text.replace("<|im_end|>", "").strip()
+
     # ------------------------------------------------------------------
     # 公共接口（与 VLXSeekWorker 一致）
     # ------------------------------------------------------------------
@@ -186,7 +206,7 @@ class VLXSeekVLLMWorker:
         (out,), elapsed = self._run_generate(
             [request], max_new_tokens, temperature, top_p, repetition_penalty
         )
-        answer = out.outputs[0].text.strip()
+        answer = self._decode_answer(out)
         answer = VLXSeekWorker._remap_object_tokens(answer, sorted_to_original)
         result_bbox_list = VLXSeekWorker._build_result_bbox_list(answer, caller_boxes)
         return {
@@ -232,7 +252,7 @@ class VLXSeekVLLMWorker:
         )
         results = []
         for out, (sorted_to_original, caller_boxes) in zip(outs, metas):
-            answer = out.outputs[0].text.strip()
+            answer = self._decode_answer(out)
             answer = VLXSeekWorker._remap_object_tokens(answer, sorted_to_original)
             results.append(
                 {
@@ -324,7 +344,7 @@ class VLXSeekVLLMWorker:
             "completion_tokens": 0,
         }
         for out in outs:
-            answer = out.outputs[0].text.strip()
+            answer = self._decode_answer(out)
             merged["result_bbox_list"].extend(
                 VLXSeekWorker._build_result_bbox_list(answer, caller_boxes)
             )
