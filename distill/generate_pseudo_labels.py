@@ -404,8 +404,11 @@ def run_pipeline(args: argparse.Namespace, image_paths: list[Path] | None = None
             file=sys.stderr,
         )
 
+    from tqdm import tqdm
+
     total = len(image_paths)
-    for i, img_path in enumerate(image_paths):
+    pbar = tqdm(image_paths, desc="生成伪标签", unit="图", file=sys.stderr)
+    for i, img_path in enumerate(pbar):
         if img_path.name in done_names:
             continue
 
@@ -441,7 +444,7 @@ def run_pipeline(args: argparse.Namespace, image_paths: list[Path] | None = None
                 )
                 detections = [(rb["label"], rb["xmin"], rb["ymin"], rb["xmax"], rb["ymax"]) for rb in result.get("result_bbox_list", [])]
         except Exception as exc:  # 单张失败不中断整体
-            print(f"[{i + 1}/{total}] 失败 {img_path.name}: {exc}", file=sys.stderr)
+            pbar.write(f"[{i + 1}/{total}] 失败 {img_path.name}: {exc}")
             if use_batch:
                 worker.clear_image_cache()
             continue
@@ -454,10 +457,7 @@ def run_pipeline(args: argparse.Namespace, image_paths: list[Path] | None = None
 
         if (i + 1) % 10 == 0 or (i + 1) == total:
             save_coco(coco, args.output)
-            print(
-                f"[{i + 1}/{total}] {img_path.name} 完成，" f"累计 {len(coco['images'])} 图 / {len(coco['annotations'])} 框",
-                file=sys.stderr,
-            )
+        pbar.set_postfix_str(f"{len(coco['images'])} 图 / {len(coco['annotations'])} 框")
 
     save_coco(coco, args.output)
     print(f"伪标签已保存到 {args.output}")
@@ -472,8 +472,28 @@ def _split_shards(paths: list[Path], num_shards: int) -> list[list[Path]]:
     return shards
 
 
+def _setup_logging(log_path: str) -> None:
+    """把框架警告/日志写入 log_path（追加模式），终端只保留脚本自身的进度输出。"""
+    import logging
+
+    os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+    os.environ.setdefault("VLLM_LOGGING_LEVEL", "WARNING")
+
+    handler = logging.FileHandler(log_path, mode="a", encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    root = logging.getLogger()
+    root.setLevel(logging.WARNING)
+    root.addHandler(handler)
+
+    # warnings.warn 触发的警告（torch/transformers 的 FutureWarning/UserWarning 等）
+    # 统一走 py.warnings logger → 写入日志文件，不再刷终端
+    logging.captureWarnings(True)
+
+
 def _worker_shard(args: argparse.Namespace, gpu_id: int, shard_paths: list[Path], output_path: str) -> None:
     """子进程入口：用 CUDA_VISIBLE_DEVICES 隔离到指定 GPU 后处理一份分片。"""
+    _setup_logging(output_path + ".log")
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
     shard_args = argparse.Namespace(**vars(args))
     shard_args.device = "cuda:0"  # 隔离后 cuda:0 即物理 GPU gpu_id
@@ -563,6 +583,7 @@ def _resolve_detector_checkpoint(args: argparse.Namespace) -> None:
 
 def main() -> None:
     args = parse_args()
+    _setup_logging(args.output + ".log")
     _resolve_detector_checkpoint(args)
     if args.gpu_ids:
         run_multigpu(args)
