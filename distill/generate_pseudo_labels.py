@@ -66,7 +66,8 @@ from coco_utils import save_coco, xyxy_to_xywh  # noqa: E402
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
-# 任务队列哨兵：worker 取到后处理完当前批即退出（主进程确认全部消费后统一发送）
+# 任务队列哨兵：worker 取到后处理完当前批即退出（主进程确认全部消费后统一发送）。
+# 必须用 None（spawn 下跨进程恒为同一单例，worker 侧用 is 比较）；勿改为可变对象。
 _SENTINEL = None
 
 
@@ -425,10 +426,10 @@ def run_pipeline(
         if img_path.name in done_names:
             continue
 
-        image = Image.open(img_path).convert("RGB")
-        width, height = image.size
-
         try:
+            image = Image.open(img_path).convert("RGB")
+            width, height = image.size
+
             if args.crop_inference:
                 detections = detect_with_crop(image, worker, categories, args, cat_id_map)
             elif use_batch:
@@ -558,7 +559,9 @@ def _collect_done_names(shard_paths: list[str]) -> set[str]:
                 data = json.load(f)
         except (json.JSONDecodeError, OSError):
             continue
-        done.update(img["file_name"] for img in data.get("images", []))
+        if not isinstance(data, dict):
+            continue
+        done.update(img.get("file_name") for img in data.get("images", []) if isinstance(img.get("file_name"), str))
     return done
 
 
@@ -631,14 +634,29 @@ def run_multigpu(args: argparse.Namespace) -> None:
 
     # 主进程统计消费数：worker 全部退出但未消费完 -> 有任务丢失，中止
     consumed = 0
+    stalled = 0
     while consumed < len(pending):
         try:
             ack_batch = done_queue.get(timeout=5)
         except mp.queues.Empty:
-            if not any(p.is_alive() for p in processes):
-                raise RuntimeError(f"所有 worker 已退出但仅消费 {consumed}/{len(pending)} 张，" f"任务可能丢失，请用 --resume 重跑")
+            alive = [p for p in processes if p.is_alive()]
+            dead = [p for p in processes if not p.is_alive() and p.exitcode != 0]
+            if not alive:
+                raise RuntimeError(
+                    f"所有 worker 已退出但仅消费 {consumed}/{len(pending)} 张，"
+                    f"任务可能丢失，请用 --resume 重跑"
+                )
+            if dead:
+                # 有 worker 崩溃（exitcode≠0）：消费停滞即中止，避免无限轮询
+                stalled += 1
+                if stalled >= 3:
+                    raise RuntimeError(
+                        f"{len(dead)} 个 worker 已崩溃且消费停滞 {consumed}/{len(pending)}，"
+                        f"请用 --resume 重跑"
+                    )
             continue
         consumed += len(ack_batch)
+        stalled = 0
 
     # 全部确认消费：向每个 worker 发哨兵，优雅退出
     for _ in gpu_ids:
