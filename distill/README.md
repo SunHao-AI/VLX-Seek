@@ -70,11 +70,13 @@ python distill/generate_pseudo_labels.py \
   --categories "person; car; dog" \
   --output data/pseudo_labels.json \
   --model-path resources/VLX-Seek-1.5-10B \
-  --device cuda
+  --device cuda \
+  --resume
 ```
 
 - 每张图先用 WeDetect 生成候选区域（proposals），再调 VLX-Seek 开放词汇检测，输出 `{label, bbox}` 写入 COCO。
-- 支持 `--resume` 断点续跑、`--start/--end-index` 分片、`--min-area` 过滤小框、`--gpu-ids` 多卡并行。
+- 支持 `--start/--end-index` 分片、`--min-area` 过滤小框、`--gpu-ids` 多卡并行。
+- **建议始终加 `--resume`**：脚本每 10 张图落盘一次，Ctrl+C / 进程中断最多丢失最近 10 张；`--resume` 会读取已有输出文件（多卡为各 `.shard<i>.json`），按 `file_name` 跳过已处理图像，只跑剩余部分，实现断点续跑。不加 `--resume` 则从头运行并覆盖旧结果。
 - 类别按 `--categories` 精确匹配 VLX-Seek 输出的 label（忽略大小写），不匹配的框会被丢弃。
 - 默认读取 `distill/data/category_prompts.json` 的 `prompt_to_category`，把输出 COCO 的 `categories.name` 从推理 prompt 替换为真实中文类别名；可用 `--prompt-map` 指定其他映射文件，文件缺失或缺少该字段时保持 prompt 原样。
 
@@ -97,7 +99,8 @@ uv run python distill/generate_pseudo_labels.py \
   --output distill/data/pseudo_labels.json \
   --model-path resources/VLX-Seek-1.5-10B \
   --prompt-batch-size 20 \
-  --gpu-ids "0,1,2,3,4,5,6,7"
+  --gpu-ids "0,1,2,3,4,5,6,7" \
+  --resume
 ```
 
 - `--prompt-batch-size N`：每个子提示词最多包含 N 个类别，类别超过 N 时自动拆成多个子提示词循环推理（如 280 个类别 + `--prompt-batch-size 30` → 10 轮）。
@@ -117,7 +120,8 @@ python distill/generate_pseudo_labels.py \
   --output data/pseudo_labels.json \
   --model-path resources/VLX-Seek-1.5-10B \
   --prompt-batch-size 30 \
-  --gpu-ids "0,5,6,7"
+  --gpu-ids "0,5,6,7" \
+  --resume
 ```
 
 - 每个子进程通过 `CUDA_VISIBLE_DEVICES=<gpu_id>` 隔离到对应物理 GPU，再以 `cuda:0` 使用它。
