@@ -556,6 +556,7 @@ def run_multigpu(args: argparse.Namespace) -> None:
     image_paths = collect_image_paths(args.image_dir)
 
     # 用共享队列实现动态负载均衡：快卡多拉，慢卡少拉，避免静态分片导致的部分卡空闲
+    ctx = mp.get_context("spawn")
     queue = ctx.Queue()
     for p in image_paths:
         queue.put(p)
@@ -563,7 +564,6 @@ def run_multigpu(args: argparse.Namespace) -> None:
     output = Path(args.output)
     shard_outputs = [str(output.with_name(f"{output.stem}.shard{i}.json")) for i in range(len(gpu_ids))]
 
-    ctx = mp.get_context("spawn")
     processes = []
     for i, gpu_id in enumerate(gpu_ids):
         p = ctx.Process(
