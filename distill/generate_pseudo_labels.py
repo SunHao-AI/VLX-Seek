@@ -336,10 +336,33 @@ def load_prompt_to_category(prompt_map: str) -> dict[str, str]:
     return mapping if isinstance(mapping, dict) else {}
 
 
-def run_pipeline(args: argparse.Namespace, image_paths: list[Path] | None = None) -> None:
-    """单进程单卡处理一份图像列表，写入 args.output。
+def _create_worker(args: argparse.Namespace):
+    """按后端创建 VLX-Seek worker。多卡模式下每个进程只调用一次。"""
+    if args.backend == "vllm":
+        from vllm_serve.vlx_seek_vllm_worker import VLXSeekVLLMWorker
 
-    多卡模式下由子进程调用，image_paths 为分配给该卡的图像分片。
+        return VLXSeekVLLMWorker(
+            args.model_path,
+            device=args.device,
+            gpu_memory_utilization=0.85,
+            tensor_parallel_size=1,
+            max_model_len=8192,
+            letterbox_size=args.letterbox_size,
+        )
+    from vlx_seek_worker import VLXSeekWorker
+
+    return VLXSeekWorker(args.model_path, device=args.device, letterbox_size=args.letterbox_size)
+
+
+def run_pipeline(
+    args: argparse.Namespace,
+    image_paths: list[Path] | None = None,
+    worker=None,
+) -> list[str]:
+    """单进程处理一份图像列表，写入 args.output，返回成功处理的 file_name 列表。
+
+    多卡模式下由子进程调用：image_paths 为该进程本批图像，worker 已由调用方创建并传入。
+    单卡模式（worker=None）时按 args.backend 自建 worker，行为与之前完全一致。
     """
     categories = [c.strip() for c in args.categories.split(";") if c.strip()]
     if not categories:
@@ -372,24 +395,8 @@ def run_pipeline(args: argparse.Namespace, image_paths: list[Path] | None = None
         image_paths = collect_image_paths(args.image_dir)
         image_paths = image_paths[args.start_index : args.end_index]
 
-    if args.backend == "vllm":
-        from vllm_serve.vlx_seek_vllm_worker import VLXSeekVLLMWorker
-
-        worker = VLXSeekVLLMWorker(
-            args.model_path,
-            device=args.device,
-            gpu_memory_utilization=0.85,
-            tensor_parallel_size=1,
-            max_model_len=8192,
-            letterbox_size=args.letterbox_size,
-        )
-    else:
-        from vlx_seek_worker import VLXSeekWorker
-
-        worker = VLXSeekWorker(
-            args.model_path, device=args.device, letterbox_size=args.letterbox_size
-        )
-
+    if worker is None:
+        worker = _create_worker(args)
     worker.log_timing = args.log_timing
 
     next_image_id = max((img["id"] for img in coco["images"]), default=-1) + 1
@@ -407,6 +414,7 @@ def run_pipeline(args: argparse.Namespace, image_paths: list[Path] | None = None
     from tqdm import tqdm
 
     total = len(image_paths)
+    succeeded: list[str] = []
     pbar = tqdm(image_paths, desc="生成伪标签", unit="图", file=sys.stderr)
     for i, img_path in enumerate(pbar):
         if img_path.name in done_names:
@@ -448,6 +456,7 @@ def run_pipeline(args: argparse.Namespace, image_paths: list[Path] | None = None
             if use_batch:
                 worker.clear_image_cache()
             continue
+        succeeded.append(img_path.name)
 
         image_id = next_image_id
         next_image_id += 1
@@ -462,6 +471,7 @@ def run_pipeline(args: argparse.Namespace, image_paths: list[Path] | None = None
     save_coco(coco, args.output)
     print(f"伪标签已保存到 {args.output}")
     print(f"图像数: {len(coco['images'])}，标注数: {len(coco['annotations'])}")
+    return succeeded
 
 
 def _split_shards(paths: list[Path], num_shards: int) -> list[list[Path]]:
