@@ -64,6 +64,9 @@ from coco_utils import save_coco, xyxy_to_xywh  # noqa: E402
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
+# 任务队列哨兵：worker 取到后处理完当前批即退出（主进程确认全部消费后统一发送）
+_SENTINEL = None
+
 
 def _split_categories(categories: list[str], batch_size: int) -> list[list[str]]:
     """将类别列表按 batch_size 分批。batch_size<=0 或类别数<=batch_size 时返回单批。"""
@@ -474,14 +477,6 @@ def run_pipeline(
     return succeeded
 
 
-def _split_shards(paths: list[Path], num_shards: int) -> list[list[Path]]:
-    """按轮询方式把图像列表均分到 num_shards 份，尽量均衡负载。"""
-    shards: list[list[Path]] = [[] for _ in range(num_shards)]
-    for idx, path in enumerate(paths):
-        shards[idx % num_shards].append(path)
-    return shards
-
-
 def _setup_logging(log_path: str) -> None:
     """把框架警告/日志写入 log_path（追加模式），终端只保留脚本自身的进度输出。"""
     import logging
@@ -501,28 +496,41 @@ def _setup_logging(log_path: str) -> None:
     logging.captureWarnings(True)
 
 
-def _worker_shard(args: argparse.Namespace, gpu_id: int, queue: mp.Queue, output_path: str) -> None:
-    """子进程入口：用 CUDA_VISIBLE_DEVICES 隔离到指定 GPU，从共享队列拉取图像批处理。"""
+def _worker_shard(
+    args: argparse.Namespace,
+    gpu_id: int,
+    task_queue: mp.Queue,
+    done_queue: mp.Queue,
+    output_path: str,
+) -> None:
+    """子进程入口：CUDA_VISIBLE_DEVICES 隔离到指定 GPU。
+
+    进程内只创建一次模型；从共享任务队列阻塞拉取图像，凑满一批处理完后向
+    完成队列发 ack（该批全部路径，表示"已消费"）。取到哨兵即退出。
+    """
     _setup_logging(output_path + ".log")
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
     shard_args = argparse.Namespace(**vars(args))
     shard_args.device = "cuda:0"  # 隔离后 cuda:0 即物理 GPU gpu_id
     shard_args.output = output_path
 
-    # 从共享队列批量拉取图像，减少 run_pipeline 调用开销的同时保持负载均衡
+    worker = _create_worker(shard_args)
+    worker.log_timing = args.log_timing
+
     batch_size = 32
     batch: list[Path] = []
     while True:
-        try:
-            img_path = queue.get_nowait()
-            batch.append(img_path)
-            if len(batch) >= batch_size:
-                run_pipeline(shard_args, image_paths=batch)
-                batch.clear()
-        except mp.queues.Empty:
+        item = task_queue.get()  # 阻塞：不会因"队列暂时为空"提前退出
+        if item is _SENTINEL:
             break
-    if batch:
-        run_pipeline(shard_args, image_paths=batch)
+        batch.append(item)
+        if len(batch) >= batch_size:
+            run_pipeline(shard_args, image_paths=batch, worker=worker)
+            done_queue.put([str(p) for p in batch])  # ack：本批已消费
+            batch = []
+    if batch:  # 收到哨兵时兜底处理剩余不足一批的图像
+        run_pipeline(shard_args, image_paths=batch, worker=worker)
+        done_queue.put([str(p) for p in batch])
 
 
 def _collect_done_names(shard_paths: list[str]) -> set[str]:
