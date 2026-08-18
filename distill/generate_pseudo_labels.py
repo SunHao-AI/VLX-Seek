@@ -22,10 +22,12 @@
         --gpu-ids 0,1,2
 
 多卡说明：
-    --gpu-ids 指定参与推理的 GPU 索引（逗号分隔）。脚本会为每张卡启动一个
-    子进程，把图像按轮询方式分片，各子进程用 CUDA_VISIBLE_DEVICES 隔离到
-    对应 GPU，分别写入 <output>.shard<i>.json，全部完成后合并为最终输出。
-    分片文件保留，配合 --resume 可断点续跑。
+    --gpu-ids 指定参与推理的 GPU 索引（逗号分隔）。脚本启动一个主进程和每卡一个
+    spawn 子进程：主进程对输出与各 shard 文件做全局去重后，把待处理图像放入共享
+    任务队列；各子进程用 CUDA_VISIBLE_DEVICES 隔离到对应 GPU，进程内只创建一次
+    模型，从队列动态拉取图像（每 32 张一批），处理完向完成队列发 ack；主进程统计
+    全部确认后发哨兵，子进程优雅退出。各子进程分别写入 <output>.shard<i>.json，
+    全部完成后合并为最终输出。分片文件保留，配合 --resume 可断点续跑。
 
 裁剪推理说明：
     默认开启（--no-crop-inference 关闭）。对每张图用 cv_utils 的 CropImage
