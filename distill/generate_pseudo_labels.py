@@ -556,7 +556,7 @@ def run_multigpu(args: argparse.Namespace) -> None:
     image_paths = collect_image_paths(args.image_dir)
 
     # 用共享队列实现动态负载均衡：快卡多拉，慢卡少拉，避免静态分片导致的部分卡空闲
-    queue: mp.Queue = mp.Queue()
+    queue = ctx.Queue()
     for p in image_paths:
         queue.put(p)
 
