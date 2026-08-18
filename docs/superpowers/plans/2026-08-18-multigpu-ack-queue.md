@@ -191,9 +191,12 @@ def _make_image(path: Path) -> None:
 def test_run_pipeline_reuses_injected_worker_and_returns_success():
     real_detect_with_crop = gpl.detect_with_crop
     real_create_worker = gpl._create_worker
+    real_load_proposals = gpl.load_proposals
     try:
         gpl.detect_with_crop = lambda image, worker, categories, args, cat_id_map: worker.detect(image, [], categories)
         gpl._create_worker = lambda args: (_ for _ in ()).throw(AssertionError("不应自建 worker"))
+        # crop_inference=False 时 run_pipeline 会调 load_proposals 构建真实 WeDetect，必须 stub 掉
+        gpl.load_proposals = lambda image, detector_checkpoint, max_proposals: []
 
         with tempfile.TemporaryDirectory() as tmp:
             tmp = Path(tmp)
@@ -213,14 +216,17 @@ def test_run_pipeline_reuses_injected_worker_and_returns_success():
     finally:
         gpl.detect_with_crop = real_detect_with_crop
         gpl._create_worker = real_create_worker
+        gpl.load_proposals = real_load_proposals
 
 
 def test_run_pipeline_creates_worker_when_none_and_resume_skips():
     real_detect_with_crop = gpl.detect_with_crop
     real_create_worker = gpl._create_worker
+    real_load_proposals = gpl.load_proposals
     try:
         gpl.detect_with_crop = lambda image, worker, categories, args, cat_id_map: worker.detect(image, [], categories)
         gpl._create_worker = lambda args: FakeWorker()
+        gpl.load_proposals = lambda image, detector_checkpoint, max_proposals: []
 
         with tempfile.TemporaryDirectory() as tmp:
             tmp = Path(tmp)
@@ -241,6 +247,7 @@ def test_run_pipeline_creates_worker_when_none_and_resume_skips():
     finally:
         gpl.detect_with_crop = real_detect_with_crop
         gpl._create_worker = real_create_worker
+        gpl.load_proposals = real_load_proposals
 
 
 if __name__ == "__main__":
@@ -388,7 +395,16 @@ def _worker_shard(
     batch_size = 32
     batch: list[Path] = []
     while True:
-        item = task_queue.get()  # 阻塞：不会因"队列暂时为空"提前退出
+        try:
+            item = task_queue.get(timeout=1)
+        except mp.queues.Empty:
+            # 队列暂时无任务：flush 不满一批的残批并 ack，避免残批等哨兵
+            # 导致主进程统计不到消费数而死锁（pending 非 batch_size 倍数时）。
+            if batch:
+                run_pipeline(shard_args, image_paths=batch, worker=worker)
+                done_queue.put([str(p) for p in batch])  # ack：本批已消费
+                batch = []
+            continue
         if item is _SENTINEL:
             break
         batch.append(item)
