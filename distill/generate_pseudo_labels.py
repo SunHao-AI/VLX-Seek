@@ -515,6 +515,24 @@ def _worker_shard(args: argparse.Namespace, gpu_id: int, queue: mp.Queue, output
         run_pipeline(shard_args, image_paths=batch)
 
 
+def _collect_done_names(shard_paths: list[str]) -> set[str]:
+    """扫描输出文件与各 shard 文件，收集已处理图像的 file_name（全局去重）。
+
+    文件缺失或损坏时跳过，保证 --resume 在共享队列分发下不重复处理已完成图像。
+    """
+    done: set[str] = set()
+    for path in shard_paths:
+        if not Path(path).is_file():
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            continue
+        done.update(img["file_name"] for img in data.get("images", []))
+    return done
+
+
 def merge_shards(shard_paths: list[str], output_path: str) -> None:
     """把各 GPU 分片文件合并为最终 COCO JSON，并重排 image/annotation id。"""
     merged: dict = {"images": [], "annotations": [], "categories": None}
