@@ -491,14 +491,28 @@ def _setup_logging(log_path: str) -> None:
     logging.captureWarnings(True)
 
 
-def _worker_shard(args: argparse.Namespace, gpu_id: int, shard_paths: list[Path], output_path: str) -> None:
-    """子进程入口：用 CUDA_VISIBLE_DEVICES 隔离到指定 GPU 后处理一份分片。"""
+def _worker_shard(args: argparse.Namespace, gpu_id: int, queue: mp.Queue, output_path: str) -> None:
+    """子进程入口：用 CUDA_VISIBLE_DEVICES 隔离到指定 GPU，从共享队列拉取图像批处理。"""
     _setup_logging(output_path + ".log")
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
     shard_args = argparse.Namespace(**vars(args))
     shard_args.device = "cuda:0"  # 隔离后 cuda:0 即物理 GPU gpu_id
     shard_args.output = output_path
-    run_pipeline(shard_args, image_paths=shard_paths)
+
+    # 从共享队列批量拉取图像，减少 run_pipeline 调用开销的同时保持负载均衡
+    batch_size = 32
+    batch: list[Path] = []
+    while True:
+        try:
+            img_path = queue.get_nowait()
+            batch.append(img_path)
+            if len(batch) >= batch_size:
+                run_pipeline(shard_args, image_paths=batch)
+                batch.clear()
+        except mp.queues.Empty:
+            break
+    if batch:
+        run_pipeline(shard_args, image_paths=batch)
 
 
 def merge_shards(shard_paths: list[str], output_path: str) -> None:
@@ -531,14 +545,20 @@ def merge_shards(shard_paths: list[str], output_path: str) -> None:
     save_coco(merged, output_path)
 
 
+# Current flow: round-robin split of image_paths into shards, one shard per GPU.
+# Each worker processes its shard independently and writes <output>.shard<i>.json.
 def run_multigpu(args: argparse.Namespace) -> None:
-    """多卡入口：按 --gpu-ids 分片并行推理，最后合并结果。"""
+    """多卡入口：创建共享队列，各 GPU 进程动态拉取图像，最后合并结果。"""
     gpu_ids = [int(x) for x in args.gpu_ids.split(",") if x.strip()]
     if not gpu_ids:
         raise ValueError("--gpu-ids 不能为空")
 
     image_paths = collect_image_paths(args.image_dir)
-    shards = _split_shards(image_paths, len(gpu_ids))
+
+    # 用共享队列实现动态负载均衡：快卡多拉，慢卡少拉，避免静态分片导致的部分卡空闲
+    queue: mp.Queue = mp.Queue()
+    for p in image_paths:
+        queue.put(p)
 
     output = Path(args.output)
     shard_outputs = [str(output.with_name(f"{output.stem}.shard{i}.json")) for i in range(len(gpu_ids))]
@@ -548,7 +568,7 @@ def run_multigpu(args: argparse.Namespace) -> None:
     for i, gpu_id in enumerate(gpu_ids):
         p = ctx.Process(
             target=_worker_shard,
-            args=(args, gpu_id, shards[i], shard_outputs[i]),
+            args=(args, gpu_id, queue, shard_outputs[i]),
         )
         p.start()
         processes.append(p)
