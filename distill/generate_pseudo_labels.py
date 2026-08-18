@@ -581,34 +581,60 @@ def merge_shards(shard_paths: list[str], output_path: str) -> None:
     save_coco(merged, output_path)
 
 
-# Current flow: round-robin split of image_paths into shards, one shard per GPU.
-# Each worker processes its shard independently and writes <output>.shard<i>.json.
 def run_multigpu(args: argparse.Namespace) -> None:
-    """多卡入口：创建共享队列，各 GPU 进程动态拉取图像，最后合并结果。"""
+    """多卡入口：共享任务队列 + 消费确认 + 哨兵退出。
+
+    1. 主进程扫描已有输出与 shard 文件做全局去重，只分发未处理图像。
+    2. 各 GPU 子进程从任务队列阻塞拉取、处理后向完成队列发 ack。
+    3. 主进程统计消费数，全部确认后发哨兵，join 后合并 shard。
+    """
     gpu_ids = [int(x) for x in args.gpu_ids.split(",") if x.strip()]
     if not gpu_ids:
         raise ValueError("--gpu-ids 不能为空")
 
     image_paths = collect_image_paths(args.image_dir)
-
-    # 用共享队列实现动态负载均衡：快卡多拉，慢卡少拉，避免静态分片导致的部分卡空闲
-    ctx = mp.get_context("spawn")
-    queue = ctx.Queue()
-    for p in image_paths:
-        queue.put(p)
-
     output = Path(args.output)
     shard_outputs = [str(output.with_name(f"{output.stem}.shard{i}.json")) for i in range(len(gpu_ids))]
+
+    # 断点续跑：全局去重（扫描最终输出 + 各 shard），只分发未处理图像
+    done_names = _collect_done_names([args.output, *shard_outputs])
+    pending = [p for p in image_paths if p.name not in done_names]
+    if done_names:
+        print(f"断点续跑：跳过 {len(done_names)} 张已处理图像", file=sys.stderr)
+    print(f"待处理图像: {len(pending)} 张，共 {len(gpu_ids)} 卡", file=sys.stderr)
+
+    ctx = mp.get_context("spawn")
+    task_queue: mp.Queue = ctx.Queue()
+    done_queue: mp.Queue = ctx.Queue()
+    for p in pending:
+        task_queue.put(p)
 
     processes = []
     for i, gpu_id in enumerate(gpu_ids):
         p = ctx.Process(
             target=_worker_shard,
-            args=(args, gpu_id, queue, shard_outputs[i]),
+            args=(args, gpu_id, task_queue, done_queue, shard_outputs[i]),
         )
         p.start()
         processes.append(p)
 
+    # 主进程统计消费数：worker 全部退出但未消费完 -> 有任务丢失，中止
+    consumed = 0
+    while consumed < len(pending):
+        try:
+            ack_batch = done_queue.get(timeout=5)
+        except mp.queues.Empty:
+            if not any(p.is_alive() for p in processes):
+                raise RuntimeError(
+                    f"所有 worker 已退出但仅消费 {consumed}/{len(pending)} 张，"
+                    f"任务可能丢失，请用 --resume 重跑"
+                )
+            continue
+        consumed += len(ack_batch)
+
+    # 全部确认消费：向每个 worker 发哨兵，优雅退出
+    for _ in gpu_ids:
+        task_queue.put(_SENTINEL)
     for p in processes:
         p.join()
 
