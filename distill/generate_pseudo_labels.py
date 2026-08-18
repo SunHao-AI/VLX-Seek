@@ -520,7 +520,16 @@ def _worker_shard(
     batch_size = 32
     batch: list[Path] = []
     while True:
-        item = task_queue.get()  # 阻塞：不会因"队列暂时为空"提前退出
+        try:
+            item = task_queue.get(timeout=1)
+        except mp.queues.Empty:
+            # 队列暂时无任务：flush 不满一批的残批并 ack，避免残批等哨兵
+            # 导致主进程统计不到消费数而死锁（pending 非 batch_size 倍数时）。
+            if batch:
+                run_pipeline(shard_args, image_paths=batch, worker=worker)
+                done_queue.put([str(p) for p in batch])  # ack：本批已消费
+                batch = []
+            continue
         if item is _SENTINEL:
             break
         batch.append(item)
@@ -625,10 +634,7 @@ def run_multigpu(args: argparse.Namespace) -> None:
             ack_batch = done_queue.get(timeout=5)
         except mp.queues.Empty:
             if not any(p.is_alive() for p in processes):
-                raise RuntimeError(
-                    f"所有 worker 已退出但仅消费 {consumed}/{len(pending)} 张，"
-                    f"任务可能丢失，请用 --resume 重跑"
-                )
+                raise RuntimeError(f"所有 worker 已退出但仅消费 {consumed}/{len(pending)} 张，" f"任务可能丢失，请用 --resume 重跑")
             continue
         consumed += len(ack_batch)
 
