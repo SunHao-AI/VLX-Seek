@@ -64,7 +64,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from coco_utils import save_coco, xyxy_to_xywh  # noqa: E402
+from distill.coco_utils import save_coco, xyxy_to_xywh  # noqa: E402
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
