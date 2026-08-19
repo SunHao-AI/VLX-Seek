@@ -25,8 +25,9 @@
     --gpu-ids 指定参与推理的 GPU 索引（逗号分隔）。脚本启动一个主进程和每卡一个
     spawn 子进程：主进程对输出与各 shard 文件做全局去重后，把待处理图像放入共享
     任务队列；各子进程用 CUDA_VISIBLE_DEVICES 隔离到对应 GPU，进程内只创建一次
-    模型，从队列动态拉取图像（每 32 张一批），处理完向完成队列发 ack；主进程统计
-    全部确认后发哨兵，子进程优雅退出。各子进程分别写入 <output>.shard<i>.json，
+    模型，从队列逐张拉取图像（处理完一张立即 ack 并取新图，负载均衡粒度最细），
+    进度在进程内跨批次累积，每 10 张落盘一次、退出前收尾落盘；主进程统计全部
+    确认后发哨兵，子进程优雅退出。各子进程分别写入 <output>.shard<i>.json，
     全部完成后合并为最终输出。分片文件保留，配合 --resume 可断点续跑。
 
 裁剪推理说明：
@@ -342,6 +343,56 @@ def load_prompt_to_category(prompt_map: str) -> dict[str, str]:
     return mapping if isinstance(mapping, dict) else {}
 
 
+class _PipelineState:
+    """跨 run_pipeline 调用累积的进度状态（多卡 worker 每进程一个）。
+
+    首次创建时从输出文件恢复一次（--resume）；此后在内存累积，由 maybe_save()/
+    save() 控制落盘频率，避免每次调用全量重读/重写 JSON 的 I/O 放大
+    （batch=1 逐张拉取时尤为重要）。
+    """
+
+    def __init__(self, args: argparse.Namespace) -> None:
+        self.output = args.output
+        categories = [c.strip() for c in args.categories.split(";") if c.strip()]
+        prompt_to_category = load_prompt_to_category(args.prompt_map)
+
+        def real_category_name(prompt: str) -> str:
+            return prompt_to_category.get(prompt, prompt)
+
+        self.coco: dict = {
+            "images": [],
+            "annotations": [],
+            "categories": [{"id": idx, "name": real_category_name(name)} for idx, name in enumerate(categories)],
+        }
+        self.cat_id_map: dict[str, int] = {name.lower(): idx for idx, name in enumerate(categories)}
+        self.next_image_id = 0
+        self.next_ann_id = 0
+        self._saved_count = 0
+
+        # 断点续跑：仅创建时从已有输出恢复一次
+        if args.resume and Path(self.output).is_file():
+            with open(self.output, "r", encoding="utf-8") as f:
+                existing = json.load(f)
+            self.coco = existing
+            self.next_image_id = max((img["id"] for img in self.coco["images"]), default=-1) + 1
+            self.next_ann_id = max((ann["id"] for ann in self.coco["annotations"]), default=-1) + 1
+            self._saved_count = len(self.coco["images"])
+            print(f"断点续跑：跳过 {len(self.coco['images'])} 张已处理图像", file=sys.stderr)
+
+        self.done_names: set[str] = {img["file_name"] for img in self.coco["images"]}
+
+    def maybe_save(self, interval: int) -> None:
+        """每累积 interval 张落盘一次（崩溃时最多丢失 interval-1 张，--resume 会补跑）。"""
+        if len(self.coco["images"]) - self._saved_count >= interval:
+            save_coco(self.coco, self.output)
+            self._saved_count = len(self.coco["images"])
+
+    def save(self) -> None:
+        """收尾/显式落盘（worker 收到哨兵退出前调用）。"""
+        save_coco(self.coco, self.output)
+        self._saved_count = len(self.coco["images"])
+
+
 def _create_worker(args: argparse.Namespace):
     """按后端创建 VLX-Seek worker。多卡模式下每个进程只调用一次。"""
     if args.backend == "vllm":
@@ -364,38 +415,27 @@ def run_pipeline(
     args: argparse.Namespace,
     image_paths: list[Path] | None = None,
     worker=None,
+    state: _PipelineState | None = None,
+    defer_save: bool = False,
 ) -> list[str]:
-    """单进程处理一份图像列表，写入 args.output，返回成功处理的 file_name 列表。
+    """单进程处理一份图像列表，返回成功处理的 file_name 列表。
 
-    多卡模式下由子进程调用：image_paths 为该进程本批图像，worker 已由调用方创建并传入。
-    单卡模式（worker=None）时按 args.backend 自建 worker，行为与之前完全一致。
+    多卡模式下由子进程调用：image_paths 为该进程本批图像，worker 已创建并传入，
+    state 为该进程跨批次的进度状态（传入后复用，不重读磁盘），defer_save=True 时
+    仅按 interval 定期落盘且静默，收尾落盘由调用方在退出前调 state.save()。
+    单卡模式（worker/state 均 None）时自建 worker 与状态，行为与之前完全一致。
     """
     categories = [c.strip() for c in args.categories.split(";") if c.strip()]
     if not categories:
         raise ValueError("--categories 不能为空")
 
-    # label(小写) -> category_id 映射
-    cat_id_map = {name.lower(): idx for idx, name in enumerate(categories)}
-    # 反向映射：推理 prompt -> 真实中文类别名，替换 COCO categories.name
-    prompt_to_category = load_prompt_to_category(args.prompt_map)
-
-    def real_category_name(prompt: str) -> str:
-        return prompt_to_category.get(prompt, prompt)
-
-    coco = {
-        "images": [],
-        "annotations": [],
-        "categories": [{"id": idx, "name": real_category_name(name)} for idx, name in enumerate(categories)],
-    }
-
-    # 断点续跑：读取已有输出中的 file_name
-    done_names: set[str] = set()
-    if args.resume and Path(args.output).is_file():
-        with open(args.output, "r", encoding="utf-8") as f:
-            existing = json.load(f)
-        done_names = {img["file_name"] for img in existing["images"]}
-        coco = existing
-        print(f"断点续跑：跳过 {len(done_names)} 张已处理图像", file=sys.stderr)
+    if state is None:
+        state = _PipelineState(args)
+    coco = state.coco
+    cat_id_map = state.cat_id_map
+    done_names = state.done_names
+    next_image_id = state.next_image_id
+    next_ann_id = state.next_ann_id
 
     if image_paths is None:
         image_paths = collect_image_paths(args.image_dir)
@@ -405,12 +445,9 @@ def run_pipeline(
         worker = _create_worker(args)
     worker.log_timing = args.log_timing
 
-    next_image_id = max((img["id"] for img in coco["images"]), default=-1) + 1
-    next_ann_id = max((ann["id"] for ann in coco["annotations"]), default=-1) + 1
-
-    # 类别分批日志
+    # 类别分批日志（多卡 defer_save 下静默，避免每批/每张刷屏）
     use_batch = args.prompt_batch_size > 0 and len(categories) > args.prompt_batch_size
-    if use_batch:
+    if use_batch and not defer_save:
         n_batches = len(_split_categories(categories, args.prompt_batch_size))
         print(
             f"类别分批: {len(categories)} 个类别 → {n_batches} 批，" f"每批 ≤{args.prompt_batch_size} 个",
@@ -421,7 +458,8 @@ def run_pipeline(
 
     total = len(image_paths)
     succeeded: list[str] = []
-    pbar = tqdm(image_paths, desc="生成伪标签", unit="图", file=sys.stderr)
+    # batch=1 逐张拉取时每张一个进度条会刷屏，单张/少张时不显示
+    pbar = tqdm(image_paths, desc="生成伪标签", unit="图", file=sys.stderr, disable=total <= 1)
     for i, img_path in enumerate(pbar):
         if img_path.name in done_names:
             continue
@@ -463,6 +501,7 @@ def run_pipeline(
                 worker.clear_image_cache()
             continue
         succeeded.append(img_path.name)
+        done_names.add(img_path.name)
 
         image_id = next_image_id
         next_image_id += 1
@@ -470,13 +509,15 @@ def run_pipeline(
 
         next_ann_id = _add_annotations(coco, image_id, detections, cat_id_map, args.min_area, next_ann_id)
 
-        if (i + 1) % 10 == 0 or (i + 1) == total:
-            save_coco(coco, args.output)
+        state.maybe_save(10)  # 定期落盘：每累积 10 张一次，收尾落盘由调用方负责
         pbar.set_postfix_str(f"{len(coco['images'])} 图 / {len(coco['annotations'])} 框")
 
-    save_coco(coco, args.output)
-    print(f"伪标签已保存到 {args.output}")
-    print(f"图像数: {len(coco['images'])}，标注数: {len(coco['annotations'])}")
+    state.next_image_id = next_image_id
+    state.next_ann_id = next_ann_id
+    if not defer_save:
+        state.save()
+        print(f"伪标签已保存到 {args.output}")
+        print(f"图像数: {len(coco['images'])}，标注数: {len(coco['annotations'])}")
     return succeeded
 
 
@@ -520,16 +561,19 @@ def _worker_shard(
     worker = _create_worker(shard_args)
     worker.log_timing = args.log_timing
 
-    batch_size = 32
+    # 跨批次累积的进度状态：首次创建时恢复一次（--resume），此后内存累积，
+    # 由 maybe_save(10) 定期落盘 + 退出前 save() 收尾，I/O 与拉取粒度解耦。
+    state = _PipelineState(shard_args)
+
+    batch_size = 1  # 每卡逐张拉取：处理完一张立即 ack 再取新图，负载均衡粒度最细
     batch: list[Path] = []
     while True:
         try:
             item = task_queue.get(timeout=1)
         except mp.queues.Empty:
-            # 队列暂时无任务：flush 不满一批的残批并 ack，避免残批等哨兵
-            # 导致主进程统计不到消费数而死锁（pending 非 batch_size 倍数时）。
+            # 队列暂时无任务：flush 残批并 ack，避免残批等哨兵导致死锁。
             if batch:
-                run_pipeline(shard_args, image_paths=batch, worker=worker)
+                run_pipeline(shard_args, image_paths=batch, worker=worker, state=state, defer_save=True)
                 done_queue.put([str(p) for p in batch])  # ack：本批已消费
                 batch = []
             continue
@@ -537,12 +581,13 @@ def _worker_shard(
             break
         batch.append(item)
         if len(batch) >= batch_size:
-            run_pipeline(shard_args, image_paths=batch, worker=worker)
+            run_pipeline(shard_args, image_paths=batch, worker=worker, state=state, defer_save=True)
             done_queue.put([str(p) for p in batch])  # ack：本批已消费
             batch = []
-    if batch:  # 收到哨兵时兜底处理剩余不足一批的图像
-        run_pipeline(shard_args, image_paths=batch, worker=worker)
+    if batch:  # 收到哨兵时兜底处理剩余图像
+        run_pipeline(shard_args, image_paths=batch, worker=worker, state=state, defer_save=True)
         done_queue.put([str(p) for p in batch])
+    state.save()  # 收尾落盘（worker 退出前）
 
 
 def _collect_done_names(shard_paths: list[str]) -> set[str]:
@@ -642,18 +687,12 @@ def run_multigpu(args: argparse.Namespace) -> None:
             alive = [p for p in processes if p.is_alive()]
             dead = [p for p in processes if not p.is_alive() and p.exitcode != 0]
             if not alive:
-                raise RuntimeError(
-                    f"所有 worker 已退出但仅消费 {consumed}/{len(pending)} 张，"
-                    f"任务可能丢失，请用 --resume 重跑"
-                )
+                raise RuntimeError(f"所有 worker 已退出但仅消费 {consumed}/{len(pending)} 张，" f"任务可能丢失，请用 --resume 重跑")
             if dead:
                 # 有 worker 崩溃（exitcode≠0）：消费停滞即中止，避免无限轮询
                 stalled += 1
                 if stalled >= 3:
-                    raise RuntimeError(
-                        f"{len(dead)} 个 worker 已崩溃且消费停滞 {consumed}/{len(pending)}，"
-                        f"请用 --resume 重跑"
-                    )
+                    raise RuntimeError(f"{len(dead)} 个 worker 已崩溃且消费停滞 {consumed}/{len(pending)}，" f"请用 --resume 重跑")
             continue
         consumed += len(ack_batch)
         stalled = 0
