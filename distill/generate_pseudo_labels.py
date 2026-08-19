@@ -576,9 +576,6 @@ def _worker_shard(
     shard_args.device = "cuda:0"  # 隔离后 cuda:0 即物理 GPU gpu_id
     shard_args.output = output_path
 
-    worker = _create_worker(shard_args)
-    worker.log_timing = args.log_timing
-
     # 跨批次累积的进度状态：首次创建时恢复一次（--resume），此后内存累积，
     # 由 maybe_save(10) 定期落盘 + 退出前 save() 收尾，I/O 与拉取粒度解耦。
     state = _PipelineState(shard_args)
@@ -587,12 +584,16 @@ def _worker_shard(
     # queue-batch-size=1 时逐张拉取、处理完一张立即 ack 并取新图，负载均衡粒度最细。
     batch_size = args.queue_batch_size
     batch: list[Path] = []
+    worker = None  # 延迟初始化：仅在有任务时创建
     while True:
         try:
             item = task_queue.get(timeout=1)
         except mp.queues.Empty:
             # 队列暂时无任务：flush 残批并 ack，避免残批等哨兵导致死锁。
             if batch:
+                if worker is None:
+                    worker = _create_worker(shard_args)
+                    worker.log_timing = args.log_timing
                 run_pipeline(shard_args, image_paths=batch, worker=worker, state=state, defer_save=True)
                 done_queue.put([str(p) for p in batch])  # ack：本批已消费
                 batch = []
@@ -601,13 +602,23 @@ def _worker_shard(
             break
         batch.append(item)
         if len(batch) >= batch_size:
+            if worker is None:
+                worker = _create_worker(shard_args)
+                worker.log_timing = args.log_timing
             run_pipeline(shard_args, image_paths=batch, worker=worker, state=state, defer_save=True)
             done_queue.put([str(p) for p in batch])  # ack：本批已消费
             batch = []
     if batch:  # 收到哨兵时兜底处理剩余图像
+        if worker is None:
+            worker = _create_worker(shard_args)
+            worker.log_timing = args.log_timing
         run_pipeline(shard_args, image_paths=batch, worker=worker, state=state, defer_save=True)
         done_queue.put([str(p) for p in batch])
-    state.save()  # 收尾落盘（worker 退出前）
+    if worker is not None:
+        state.save()  # 收尾落盘（worker 退出前）
+    else:
+        # 没有创建 worker（即没有任务），仍需确保状态已保存（虽然可能无变化）
+        state.save()
 
 
 def _collect_done_names(shard_paths: list[str]) -> set[str]:
