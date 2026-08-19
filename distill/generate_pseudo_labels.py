@@ -25,10 +25,11 @@
     --gpu-ids 指定参与推理的 GPU 索引（逗号分隔）。脚本启动一个主进程和每卡一个
     spawn 子进程：主进程对输出与各 shard 文件做全局去重后，把待处理图像放入共享
     任务队列；各子进程用 CUDA_VISIBLE_DEVICES 隔离到对应 GPU，进程内只创建一次
-    模型，从队列逐张拉取图像（处理完一张立即 ack 并取新图，负载均衡粒度最细），
-    进度在进程内跨批次累积，每 10 张落盘一次、退出前收尾落盘；主进程统计全部
-    确认后发哨兵，子进程优雅退出。各子进程分别写入 <output>.shard<i>.json，
-    全部完成后合并为最终输出。分片文件保留，配合 --resume 可断点续跑。
+    模型，按 --batch-size（默认 32）从队列拉取图像，凑满一批处理完 ack 再取下一批
+    （batch=1 时逐张拉取，负载均衡粒度最细）；进度在进程内跨批次累积，每 10 张
+    落盘一次、退出前收尾落盘；主进程统计全部确认后发哨兵，子进程优雅退出。
+    各子进程分别写入 <output>.shard<i>.json，全部完成后合并为最终输出。
+    分片文件保留，配合 --resume 可断点续跑。
 
 裁剪推理说明：
     默认开启（--no-crop-inference 关闭）。对每张图用 cv_utils 的 CropImage
@@ -77,6 +78,14 @@ def _split_categories(categories: list[str], batch_size: int) -> list[list[str]]
     if batch_size <= 0 or len(categories) <= batch_size:
         return [categories]
     return [categories[i : i + batch_size] for i in range(0, len(categories), batch_size)]
+
+
+def _positive_int(value: str) -> int:
+    """argparse type：要求正整数（batch 至少为 1）。"""
+    v = int(value)
+    if v < 1:
+        raise argparse.ArgumentTypeError(f"必须 >= 1，收到 {v}")
+    return v
 
 
 def parse_args() -> argparse.Namespace:
@@ -158,6 +167,15 @@ def parse_args() -> argparse.Namespace:
         "--log-timing",
         action="store_true",
         help="打印每次 generate 的耗时与 token 数（用于定位 prefill/decode 耗时分布）。",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=_positive_int,
+        default=32,
+        help="多卡模式下每个子进程从共享队列一次性拉取的图像数（默认 32）。"
+        "拉取粒度与落盘频率解耦（进度每 10 张落盘一次，与 batch 无关）："
+        "batch=1 时逐张拉取、处理完一张立即 ack 再取新图，负载均衡粒度最细；"
+        "调大可减少 run_pipeline 调用次数。",
     )
     return parser.parse_args()
 
@@ -565,7 +583,9 @@ def _worker_shard(
     # 由 maybe_save(10) 定期落盘 + 退出前 save() 收尾，I/O 与拉取粒度解耦。
     state = _PipelineState(shard_args)
 
-    batch_size = 1  # 每卡逐张拉取：处理完一张立即 ack 再取新图，负载均衡粒度最细
+    # 从共享队列按 --batch-size 拉取（默认 32）：凑满一批处理完 ack 再取下一批。
+    # batch=1 时逐张拉取、处理完一张立即 ack 并取新图，负载均衡粒度最细。
+    batch_size = args.batch_size
     batch: list[Path] = []
     while True:
         try:
