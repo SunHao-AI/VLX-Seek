@@ -96,6 +96,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="0")
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--patience", type=int, default=30,
+        help="早停轮数：验证指标连续 N 轮无提升则提前结束（默认 30）",
+    )
     parser.add_argument("--crop-aug", action="store_true", help="启用 albumentations 随机裁剪在线增强（需 ultralytics>=8.4 + albumentations）")
     parser.add_argument("--crop-scale", type=float, nargs=2, default=[0.5, 1.0], metavar=("MIN", "MAX"), help="随机裁剪面积占原图比例范围（默认 0.5 1.0）")
     parser.add_argument("--crop-erosion", type=float, default=0.2, help="随机裁剪对目标框边缘的最大侵蚀比例 0~1（默认 0.2）")
@@ -177,6 +181,7 @@ def main() -> None:
         project=str(Path(args.output_dir)),
         name="yolo_world_finetune",
         augmentations=augmentations,
+        patience=args.patience,
     )
 
 
