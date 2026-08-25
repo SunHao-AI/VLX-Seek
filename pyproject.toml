@@ -32,8 +32,10 @@ flash-attn = [
     "flash_attn==2.8.3",
 ]
 # distill 步骤4：微调 YOLO-World（建议独立环境，避免与 torch 2.10/transformers 5.13 冲突）
+# 需要 ultralytics>=8.4（提供官方 augmentations 参数以注入 albumentations 自定义增强）
 distill = [
     "ultralytics",
+    "albumentations>=1.0.3",
 ]
 # vLLM 推理环境（.venv-vllm）需要但 vllm 未自动引入的 GPU 栈依赖
 vllm-gpu = [
