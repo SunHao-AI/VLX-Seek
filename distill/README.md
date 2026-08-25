@@ -237,6 +237,23 @@ python distill/finetune_yolo_world.py \
 - 自动划分 train/val（或传 `--val-coco-json` 指定独立验证集），转成 YOLO txt + 生成 `dataset.yaml`，调用 `YOLOWorld.train()`。
 - 首次运行会下载 YOLO-World 预训练权重与 CLIP 文本编码器权重。
 
+### 多 GPU 训练
+
+ultralytics 原生支持多卡 DDP：`--device` 传入多个设备号即可自动启动分布式训练子进程，无需改代码。
+
+```bash
+# 4 卡并行微调
+python distill/finetune_yolo_world.py \
+  --coco-json data/pseudo_labels.json \
+  --image-dir data/images \
+  --weights yolov8s-worldv2.pt \
+  --epochs 50 --imgsz 640 --batch 32 --device 0,1,2,3
+```
+
+- **`--batch` 是全局批大小**：DDP 下会被均分到各卡（每卡 = batch ÷ 卡数）。如 4 卡 + `--batch 32` → 每卡实际处理 8 张；想保持和单卡一样的有效批量就维持原值，想提升吞吐则按卡数等比放大。
+- **不能用 AutoBatch**：多卡模式下 `--batch -1` 会直接报错，必须显式指定。
+- `rect=True` 与多卡不兼容，若启用会自动被置为 False（默认关闭，无影响）。
+
 ## 端到端示例（examples/）
 
 `examples/` 提供最小可运行示例：2 张 demo 图片 + 一份示例 COCO 伪标签（`orange` / `apple`）。
