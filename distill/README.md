@@ -187,7 +187,7 @@ python distill/generate_pseudo_labels.py \
 export OPENAI_API_KEY="$API_KEY"
 uv run python distill/clean_pseudo_labels.py \
   --coco-json distill/data/pseudo_labels.json \
-  --image-dir distill/datall/images \
+  --image-dir distill/data/images \
   --base-url http://127.0.0.1:8101/v1 \
   --model qwen3.8-vllm \
   --decision-log distill/data/pseudo_labels.decisions.jsonl \
