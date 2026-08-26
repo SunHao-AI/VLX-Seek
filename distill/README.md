@@ -11,6 +11,7 @@ distill/
 ├── generate_prompts.py         # 步骤3：从检测服务生成 VLX-Seek 类别 prompt
 ├── generate_train_names.py     # 步骤3.5：LLM 增量补全 train_name（CLIP 友好英文训练名）
 ├── generate_pseudo_labels.py   # 步骤4：VLX-Seek → COCO 伪标签
+├── clean_pseudo_labels.py      # 步骤4.5（可选）：IoU-NMS 去重 + VLM 逐框清洗伪标签
 ├── convert_annotations.py      # 标注格式互转：COCO / YOLO / LabelMe（6 个方向）
 ├── finetune_yolo_world.py      # 步骤5：COCO → 官方 YOLO-World 微调
 ├── coco_utils.py               # 共享 COCO 工具（坐标转换/划分/转 YOLO txt）
@@ -24,6 +25,7 @@ distill/
 - **步骤1/2/3（抽取索引、下载图片、生成类别 prompt）**：仅需 `requests`（`pip install requests`），纯 CPU 即可。
 - **步骤3.5（增量补全 train_name，可选）**：需 `requests` 与 OpenAI 兼容 API（Key 经环境变量 `OPENAI_API_KEY` 或 `--api-key` 传入）；仅当出现新增类别且缺 `train_name` 时才需要运行。
 - **步骤4（伪标签生成）**：需要 GPU + VLX-Seek 权重（`resources/VLX-Seek-1.5-10B`）与 WeDetect 权重（`resources/wedetect_base_uni.pth`，缺失时自动下载）。依赖见项目根 `requirements.txt`。
+- **步骤4.5（VLM 清洗伪标签，可选）**：需 `requests` 与 OpenAI 兼容多模态服务（如 vLLM 部署的 Qwen3-VL）；本脚本本身纯 CPU 运行。
 - **步骤5（微调）**：需要额外安装 `ultralytics`（`pip install ultralytics`），建议独立虚拟环境，避免与项目 `torch 2.10 / transformers 5.13` 冲突。训练需足够内存/GPU。
 
 ## 步骤1：抽取图片索引
@@ -149,6 +151,76 @@ python distill/generate_pseudo_labels.py \
 - 多卡模式与 `--prompt-batch-size` 兼容：每个子进程内部同样走分批 + 图片编码复用逻辑。
 - 注意显存：每个进程需加载完整 VLX-Seek 模型（10B）+ WeDetect，N 个进程同时驻留需约 N × 20GB+ 显存。
 
+## 步骤4.5（可选）：VLM 清洗伪标签
+
+步骤4 产出的伪标签存在两类噪声：滑窗重叠导致的跨块重复框、WeDetect 召回局限导致的误检。`clean_pseudo_labels.py` 借助 OpenAI 兼容的多模态服务（具备视觉能力的 vLLM，如 Qwen3.8-27B / Qwen3-VL 等）对每条标注裁剪出小图并让 VLM 判断"图中是否存在该类目标"，只回"是/否"，据此过滤伪标签。
+
+服务端部署方式任选其一：
+
+- **modelctl 部署的多模态模型（推荐，已实测）**：`qwen3.8-vllm` 加载 `Qwen/Qwen3.8-27B`，端口 8101。该模型是原生多模态（视觉编码器 + 混合注意力），vLLM 加载 HF 权重时自动启用视觉能力：
+
+  ```bash
+  bash script/modelctl.sh start qwen3.8-vllm
+  ```
+
+  **先验证多模态可用**（`content` 返回画面描述即正常）：
+
+  ```bash
+  curl http://127.0.0.1:8101/v1/chat/completions \
+    -H "Authorization: Bearer $API_KEY" -H "Content-Type: application/json" \
+    -d '{"model":"qwen3.8-vllm","messages":[{"role":"user","content":[
+          {"type":"image_url","image_url":{"url":"https://<示例图片>.jpeg"}},
+          {"type":"text","text":"这张图片里有什么？请用一句中文简要描述。"}]}],
+          "max_tokens":150}'
+  ```
+
+- **直接 `vllm serve`**（其它多模态模型，如 Qwen3-VL-8B）：
+
+  ```bash
+  vllm serve Qwen/Qwen3-VL-8B-Instruct --port 8000
+  ```
+
+再运行清洗（本地去重 + VLM 验证一步完成），对接 `qwen3.8-vllm`：
+
+```bash
+# --api-key 默认读取环境变量 OPENAI_API_KEY
+export OPENAI_API_KEY="$API_KEY"
+uv run python distill/clean_pseudo_labels.py \
+  --coco-json distill/data/pseudo_labels.json \
+  --image-dir distill/datall/images \
+  --base-url http://127.0.0.1:8101/v1 \
+  --model qwen3.8-vllm \
+  --decision-log distill/data/pseudo_labels.decisions.jsonl \
+  --report distill/data/clean_report.json
+```
+
+对接其它 vLLM 服务时替换 `--base-url` / `--model` 即可（如 `--base-url http://localhost:8000/v1 --model Qwen/Qwen3-VL-8B-Instruct`）。`--model` 填的是 vLLM 的 served-model-name 标识符（如 `qwen3.8-vllm`），不是 HF 模型 id。
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `--coco-json` | （必填） | 输入伪标签 COCO JSON |
+| `--image-dir` | （必填） | 图像目录（COCO `file_name` 相对此目录） |
+| `--output` | `<输入名>.cleaned.json` | 清洗后 COCO 输出路径（永不覆盖输入） |
+| `--base-url` | `http://localhost:8000/v1` | OpenAI 兼容服务地址 |
+| `--model` | 环境变量 `CLEAN_VLM_MODEL` | 多模态模型名（两者均缺则报错退出） |
+| `--api-key` | 环境变量 `OPENAI_API_KEY` | API Key（本地 vLLM 可不设） |
+| `--concurrency` | `16` | 并发请求线程数（按服务吞吐调整） |
+| `--iou-threshold` | `0.55` | 同图同类别 NMS 的 IoU 阈值 |
+| `--no-dedup` | 关 | 跳过本地去重阶段，仅做 VLM 验证 |
+| `--max-side` | `512` | 裁剪图最长边超过则等比缩小后再上传 |
+| `--min-crop-pad` | `0.12` | 裁剪框四周外扩比例（保留上下文） |
+| `--decision-log` | `<输出名>.decisions.jsonl` | 决策日志 JSONL 路径（断点续跑必需） |
+| `--max-retries` | `3` | 单框请求最大重试次数 |
+| `--timeout` | `120` | 单次请求超时秒数 |
+| `--report` | 无 | 统计报告 JSON 输出路径（默认仅终端打印） |
+
+行为要点：
+
+1. **三阶段流水线**：阶段1 本地按 (图, 类别) 分组做 IoU-NMS 去重（面积大的框优先保留）；阶段2 逐框裁剪（外扩 12%、最小边 32px、JPEG 质量 85）并发送 VLM 判定；阶段3 写出——标注 id 重排连续、info/categories 原样透传、清零图像保留作负样本。
+2. **断点续跑**：每个框的判定实时追加写入决策日志；中断后原命令重跑即自动跳过已完成框（进度条 total 会扣除已判定数量）。若更改了模型/IoU 阈值等关键参数，需先删除旧日志再重跑（脚本检测到参数不一致会告警并不沿用）。
+3. **fail-open 原则**：VLM 无法判断/回复乱码/重试耗尽时保守保留该框，只有明确的"否"才删除；仅当首个请求出现连接拒绝或域名解析失败时快速退出，提示检查服务地址。
+4. **两级进度条**：外层按图像推进显示整体 ETA，内层按真实 VLM 调用框数推进显示剩余时间。
+
 ## 标注格式转换（convert_annotations.py）
 
 步骤4 输出的伪标签是 COCO 格式；微调前可能需要在 COCO / YOLO / LabelMe 之间互转（如转换后交给标注平台人工修正、或导出 YOLO txt 直接训练）。本脚本以统一中间表示实现 6 个转换方向：
@@ -256,6 +328,7 @@ python distill/finetune_yolo_world.py \
 - 自动划分 train/val（或传 `--val-coco-json` 指定独立验证集），转成 YOLO txt + 生成 `dataset.yaml`，调用 `YOLOWorld.train()`。
 - **`--category-map`（必加）**：把 `dataset.yaml` 中的类别名替换为 `category_prompts.json` 各条目的 `train_name` 英文名（原因见步骤3）。映射索引同时包含中文短类名与 prompt 文本两种键，兼容伪标签 COCO 的 `categories.name` 存储其中任意一种；遇到缺失映射或映射后重名会直接报错退出，不会静默产出坏数据集。
 - 首次运行会下载 YOLO-World 预训练权重与 CLIP 文本编码器权重。
+- 若运行过步骤4.5 清洗，把上面命令中的 `--coco-json` 换成清洗输出（如 `data/pseudo_labels.cleaned.json`）。
 
 ### 多 GPU 训练
 
@@ -297,5 +370,5 @@ python distill/finetune_yolo_world.py \
 2. **CLIP 权重下载**：微调需下载 CLIP 文本编码器权重（约 337MB）。若自动下载校验失败（网络截断），可手动下载到 ultralytics 的 `weights/clip/` 目录。
 3. **内存/GPU**：YOLO-World 训练与 VLX-Seek 推理都需要较大内存/GPU，CPU 小内存环境可能无法完成完整训练。
 4. **训练类别名必须是英文**：见步骤3 `train_name` 说明。用 `convert_annotations.py` 的 `coco2yolo` 自行转出的 `dataset.yaml` 同样保留原始（中文）类别名，直接喂给 YOLO-World 训练会踩同一个坑，需先替换为英文名。
-5. **滑窗重叠会产生重复框**：裁剪推理默认 10% 重叠，同一目标在相邻切块各检一次会写入两条近似重复标注，合并时没有跨块去重；如需更干净的伪标签，可在 COCO 上按类别做一次 IoU-NMS 过滤。
+5. **滑窗重叠会产生重复框**：裁剪推理默认 10% 重叠，同一目标在相邻切块各检一次会写入两条近似重复标注，合并时没有跨块去重；可运行步骤4.5 的 `clean_pseudo_labels.py`，其第一阶段即按类别做 IoU-NMS 去重，并可用 VLM 顺带过滤误检。
 6. **val 指标只反映对伪标签的拟合程度**：默认验证集从伪标签随机划分，mAP 衡量的是学生模型复现教师输出的能力，不等价于真实场景精度；评估真实效果需人工抽检或独立人工标注集。
