@@ -14,7 +14,8 @@
         --image-dir data/images \
         --output-dir runs/yolo_world \
         --weights yolov8s-worldv2.pt \
-        --epochs 50 --imgsz 640 --batch 16 --device 0
+        --epochs 50 --imgsz 640 --batch 16 --device 0 \
+        --category-map distill/data/category_prompts.json
 
     启用 albumentations 随机裁剪在线增强（需 ultralytics>=8.4 + albumentations，
     通过官方 model.train(augmentations=...) 参数注入）：
@@ -28,6 +29,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -104,7 +106,56 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--crop-scale", type=float, nargs=2, default=[0.5, 1.0], metavar=("MIN", "MAX"), help="随机裁剪面积占原图比例范围（默认 0.5 1.0）")
     parser.add_argument("--crop-erosion", type=float, default=0.2, help="随机裁剪对目标框边缘的最大侵蚀比例 0~1（默认 0.2）")
     parser.add_argument("--crop-prob", type=float, default=1.0, help="每张训练图应用随机裁剪的概率（默认 1.0）")
+    parser.add_argument(
+        "--category-map", default=None,
+        help="category_prompts.json 路径：训练类别名映射为其 train_name（CLIP 友好英文名）。"
+             "YOLO-World 用 CLIP 文本编码器对类别名编码，中文名会导致分类无法收敛",
+    )
     return parser.parse_args()
+
+
+def apply_category_map(names: list[str], category_map_path: str | None) -> list[str]:
+    """把 COCO 类别名映射为 category_prompts.json 中的 train_name（英文）。
+
+    category_prompts.json 同时以「中文类别名」和「prompt 文本」为键建立索引，
+    兼容伪标签 COCO 的 categories.name 存储其中任意一种字符串的情况。
+    缺失映射或映射后重名都会直接报错退出，避免静默产出坏数据集。
+    """
+    if not category_map_path:
+        return names
+    with open(category_map_path, encoding="utf-8") as f:
+        data = json.load(f)
+
+    mapping: dict[str, str] = {}
+    for zh_name, entry in data.get("categories", {}).items():
+        train_name = str(entry.get("train_name", "")).strip()
+        if not train_name:
+            continue
+        mapping.setdefault(zh_name, train_name)
+        prompt = entry.get("prompt")
+        if isinstance(prompt, str) and prompt:
+            mapping.setdefault(prompt, train_name)
+
+    missing = [name for name in names if name not in mapping]
+    if missing:
+        sys.exit(
+            f"--category-map 中缺少 {len(missing)} 个类别的 train_name，"
+            f"请先运行 distill/generate_train_names.py 补全或手动编辑: {missing[:10]}"
+        )
+
+    translated = [mapping[name] for name in names]
+    seen: dict[str, str] = {}
+    dupes = []
+    for name, train_name in zip(names, translated):
+        key = train_name.casefold()
+        if key in seen and key not in dupes:
+            dupes.append(key)
+        seen[key] = name
+    if dupes:
+        sys.exit(f"--category-map 映射后存在重复英文名: {dupes[:10]}")
+
+    print(f"已将 {len(translated)} 个类别名映射为英文 train_name")
+    return translated
 
 
 def prepare_dataset(
@@ -114,6 +165,7 @@ def prepare_dataset(
     val_coco: dict | None,
     val_ratio: float,
     seed: int,
+    category_map: str | None = None,
 ) -> Path:
     """构建 ultralytics 数据集目录并返回 dataset.yaml 路径。"""
     output_dir = Path(output_dir)
@@ -131,7 +183,7 @@ def prepare_dataset(
     coco_to_yolo_txt(train_coco, image_dir, train_images, train_labels)
     coco_to_yolo_txt(val_coco, image_dir, val_images, val_labels)
 
-    names = category_names(coco)
+    names = apply_category_map(category_names(coco), category_map)
     return write_dataset_yaml(dataset_root, names)
 
 
@@ -156,6 +208,7 @@ def main() -> None:
         val_coco,
         args.val_ratio,
         args.seed,
+        category_map=args.category_map,
     )
     print(f"数据集已就绪: {dataset_yaml}")
 

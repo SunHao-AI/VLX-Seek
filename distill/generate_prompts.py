@@ -163,14 +163,21 @@ def main() -> None:
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
 
-    # 保留用户手动优化的 prompt：已存在类别沿用原 prompt，仅更新 en_label/models
+    # 保留用户手动优化的字段：已存在类别沿用原 prompt / train_name，仅更新 en_label/models
     existing = load_existing_categories(output)
-    kept = 0
+    kept_prompt = 0
+    kept_train_name = 0
     for zh_name, entry in categories.items():
         old = existing.get(zh_name)
-        if old and isinstance(old.get("prompt"), str) and old["prompt"] != zh_name:
+        if not old:
+            continue
+        if isinstance(old.get("prompt"), str) and old["prompt"] != zh_name:
             entry["prompt"] = old["prompt"]
-            kept += 1
+            kept_prompt += 1
+        old_train_name = old.get("train_name")
+        if isinstance(old_train_name, str) and old_train_name.strip():
+            entry["train_name"] = old_train_name.strip()
+            kept_train_name += 1
 
     result = {
         "all_prompt": build_all_prompt(categories),
@@ -180,7 +187,7 @@ def main() -> None:
     with open(output, "w", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False, indent=2)
 
-    print(f"类别总数: {len(categories)}，保留手动优化 prompt: {kept}")
+    print(f"类别总数: {len(categories)}，保留手动优化 prompt: {kept_prompt}，保留 train_name: {kept_train_name}")
     print(f"已保存到 {output}")
 
 

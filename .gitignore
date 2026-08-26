@@ -291,3 +291,4 @@ distill/examples/runs/
 .gitignore
 results
 category_prompts.json
+runs/
