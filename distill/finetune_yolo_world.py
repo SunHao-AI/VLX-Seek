@@ -107,6 +107,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--crop-erosion", type=float, default=0.2, help="随机裁剪对目标框边缘的最大侵蚀比例 0~1（默认 0.2）")
     parser.add_argument("--crop-prob", type=float, default=1.0, help="每张训练图应用随机裁剪的概率（默认 1.0）")
     parser.add_argument(
+        "--optimizer", default="auto",
+        help="优化器: auto/SGD/AdamW（默认 auto；类别数大时 auto 会给出过小的 AdamW 学习率，微调建议显式指定）",
+    )
+    parser.add_argument("--lr0", type=float, default=None, help="初始学习率；缺省时沿用所选优化器的默认值")
+    parser.add_argument(
         "--category-map", default=None,
         help="category_prompts.json 路径：训练类别名映射为其 train_name（CLIP 友好英文名）。"
              "YOLO-World 用 CLIP 文本编码器对类别名编码，中文名会导致分类无法收敛",
@@ -223,7 +228,7 @@ def main() -> None:
         print("已启用 albumentations 随机裁剪在线增强")
 
     model = YOLOWorld(args.weights)
-    model.train(
+    train_kwargs = dict(
         data=str(dataset_yaml),
         epochs=args.epochs,
         imgsz=args.imgsz,
@@ -235,7 +240,11 @@ def main() -> None:
         name="yolo_world_finetune",
         augmentations=augmentations,
         patience=args.patience,
+        optimizer=args.optimizer,
     )
+    if args.lr0 is not None:
+        train_kwargs["lr0"] = args.lr0
+    model.train(**train_kwargs)
 
 
 if __name__ == "__main__":

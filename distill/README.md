@@ -9,6 +9,7 @@ distill/
 ├── extract_image_urls.py       # 步骤1：从 json 中抽取 imageUrl 索引
 ├── download_images.py          # 步骤2：按 URL 列表并发下载图片
 ├── generate_prompts.py         # 步骤3：从检测服务生成 VLX-Seek 类别 prompt
+├── generate_train_names.py     # 步骤3.5：LLM 增量补全 train_name（CLIP 友好英文训练名）
 ├── generate_pseudo_labels.py   # 步骤4：VLX-Seek → COCO 伪标签
 ├── convert_annotations.py      # 标注格式互转：COCO / YOLO / LabelMe（6 个方向）
 ├── finetune_yolo_world.py      # 步骤5：COCO → 官方 YOLO-World 微调
@@ -20,9 +21,10 @@ distill/
 
 ## 环境要求
 
-- **步骤1/2（抽取索引、下载图片）**：仅需 `requests`（`pip install requests`），纯 CPU 即可。
-- **步骤3（伪标签生成）**：需要 GPU + VLX-Seek 权重（`resources/VLX-Seek-1.5-10B`）与 WeDetect 权重（`resources/wedetect_base_uni.pth`，缺失时自动下载）。依赖见项目根 `requirements.txt`。
-- **步骤4（微调）**：需要额外安装 `ultralytics`（`pip install ultralytics`），建议独立虚拟环境，避免与项目 `torch 2.10 / transformers 5.13` 冲突。训练需足够内存/GPU。
+- **步骤1/2/3（抽取索引、下载图片、生成类别 prompt）**：仅需 `requests`（`pip install requests`），纯 CPU 即可。
+- **步骤3.5（增量补全 train_name，可选）**：需 `requests` 与 OpenAI 兼容 API（Key 经环境变量 `OPENAI_API_KEY` 或 `--api-key` 传入）；仅当出现新增类别且缺 `train_name` 时才需要运行。
+- **步骤4（伪标签生成）**：需要 GPU + VLX-Seek 权重（`resources/VLX-Seek-1.5-10B`）与 WeDetect 权重（`resources/wedetect_base_uni.pth`，缺失时自动下载）。依赖见项目根 `requirements.txt`。
+- **步骤5（微调）**：需要额外安装 `ultralytics`（`pip install ultralytics`），建议独立虚拟环境，避免与项目 `torch 2.10 / transformers 5.13` 冲突。训练需足够内存/GPU。
 
 ## 步骤1：抽取图片索引
 
@@ -57,18 +59,34 @@ python distill/generate_prompts.py
 - 请求 `GET /v2/detect/all_class`，解析出全部 中文类别 <=> 英文类别 映射。
 - 输出 `distill/data/category_prompts.json`，结构为 `{all_prompt, categories, prompt_to_category}`：
   - `all_prompt`：用 VLX-Seek 检测模板把全部类别 prompt 拼接而成，可直接用于整图开放词汇检测。
-  - `categories`：每个中文类别含 `en_label`（英文名）、`prompt`（推理文本，默认中文名）、`models`（所属任务列表）。
+  - `categories`：每个中文类别含 `en_label`（英文名）、`prompt`（推理文本，默认中文名）、`train_name`（训练用英文类名）、`models`（所属任务列表）。
   - `prompt_to_category`：反向映射 `{推理 prompt: 真实中文类别名}`，供步骤4 把输出 COCO 的 `categories.name` 还原为真实中文类别名。
 - `prompt` 可手动改成更精确的描述（如 `"卫星锅"` → `"接收电视信号的卫星天线"`）；再次运行会保留手动修改，仅更新 `en_label`/`models`。
 - 可选参数：`--url`（接口地址）、`--output`（输出路径）、`--timeout`。
+
+### train_name：训练用英文类别名
+
+`train_name` 是 CLIP 友好的小写自然英文短语（如 `人群密集` → `dense crowd`），**微调时必须用它替代中文类别名**：YOLO-World 用 CLIP 文本编码器对 `dataset.yaml` 的类别名编码生成分类器权重，中文名无法被正确编码，表现为训练 `cls_loss` 居高不下、mAP≈0。
+
+初始 280 个类别的 `train_name` 已人工翻译写入文件；新增类别缺少该字段时，可手动编辑补充，或用脚本调 OpenAI 兼容接口增量翻译：
+
+```bash
+export OPENAI_API_KEY=sk-xxx            # PowerShell: $env:OPENAI_API_KEY="sk-xxx"
+python distill/generate_train_names.py \
+  --category-prompts distill/data/category_prompts.json \
+  --model gpt-4o-mini --batch-size 40
+```
+
+- 只翻译缺失条目并追加写回；已有 `train_name`（含人工修订）永不覆盖，全部齐全时直接退出。
+- 自动校验非空、仅 ASCII、不含下划线、大小写不敏感全局唯一；单批多次重试失败时报错退出，可人工补充后重跑。
 
 ## 步骤4：生成伪标签
 
 ```bash
 python distill/generate_pseudo_labels.py \
-  --image-dir data/images \
+  --image-dir distill/data/images \
   --categories "person; car; dog" \
-  --output data/pseudo_labels.json \
+  --output distill/data/pseudo_labels.json \
   --model-path resources/VLX-Seek-1.5-10B \
   --device cuda \
   --resume
@@ -231,10 +249,12 @@ python distill/finetune_yolo_world.py \
   --coco-json data/pseudo_labels.json \
   --image-dir data/images \
   --weights yolov8s-worldv2.pt \
-  --epochs 50 --imgsz 640 --batch 16 --device 0
+  --epochs 50 --imgsz 640 --batch 16 --device 0 \
+  --category-map distill/data/category_prompts.json
 ```
 
 - 自动划分 train/val（或传 `--val-coco-json` 指定独立验证集），转成 YOLO txt + 生成 `dataset.yaml`，调用 `YOLOWorld.train()`。
+- **`--category-map`（必加）**：把 `dataset.yaml` 中的类别名替换为 `category_prompts.json` 各条目的 `train_name` 英文名（原因见步骤3）。映射索引同时包含中文短类名与 prompt 文本两种键，兼容伪标签 COCO 的 `categories.name` 存储其中任意一种；遇到缺失映射或映射后重名会直接报错退出，不会静默产出坏数据集。
 - 首次运行会下载 YOLO-World 预训练权重与 CLIP 文本编码器权重。
 
 ### 多 GPU 训练
@@ -247,7 +267,8 @@ python distill/finetune_yolo_world.py \
   --coco-json data/pseudo_labels.json \
   --image-dir data/images \
   --weights yolov8s-worldv2.pt \
-  --epochs 50 --imgsz 640 --batch 32 --device 0,1,2,3
+  --epochs 50 --imgsz 640 --batch 32 --device 0,1,2,3 \
+  --category-map distill/data/category_prompts.json
 ```
 
 - **`--batch` 是全局批大小**：DDP 下会被均分到各卡（每卡 = batch ÷ 卡数）。如 4 卡 + `--batch 32` → 每卡实际处理 8 张；想保持和单卡一样的有效批量就维持原值，想提升吞吐则按卡数等比放大。
@@ -268,10 +289,13 @@ python distill/finetune_yolo_world.py \
   --epochs 1 --imgsz 320 --batch 1 --device cpu --workers 0 --val-ratio 0.5
 ```
 
-> 说明：`examples/pseudo_labels.json` 是手工构造的示例，用于验证微调流程；真实场景请用步骤1 由 VLX-Seek 生成。
+> 说明：`examples/pseudo_labels.json` 是手工构造的示例（类名已是英文，无需 `--category-map`），用于验证微调流程；真实场景请用步骤4 由 VLX-Seek 生成。
 
 ## 注意事项
 
 1. **伪标签质量受 proposal 召回限制**：VLX-Seek 是"区域检索"而非"坐标回归"，只能从 WeDetect 提出的候选框中选择。若 WeDetect 漏检目标，伪标签会系统性漏检。可提高 `num_proposals` 或换更强的 proposal 生成器。
 2. **CLIP 权重下载**：微调需下载 CLIP 文本编码器权重（约 337MB）。若自动下载校验失败（网络截断），可手动下载到 ultralytics 的 `weights/clip/` 目录。
 3. **内存/GPU**：YOLO-World 训练与 VLX-Seek 推理都需要较大内存/GPU，CPU 小内存环境可能无法完成完整训练。
+4. **训练类别名必须是英文**：见步骤3 `train_name` 说明。用 `convert_annotations.py` 的 `coco2yolo` 自行转出的 `dataset.yaml` 同样保留原始（中文）类别名，直接喂给 YOLO-World 训练会踩同一个坑，需先替换为英文名。
+5. **滑窗重叠会产生重复框**：裁剪推理默认 10% 重叠，同一目标在相邻切块各检一次会写入两条近似重复标注，合并时没有跨块去重；如需更干净的伪标签，可在 COCO 上按类别做一次 IoU-NMS 过滤。
+6. **val 指标只反映对伪标签的拟合程度**：默认验证集从伪标签随机划分，mAP 衡量的是学生模型复现教师输出的能力，不等价于真实场景精度；评估真实效果需人工抽检或独立人工标注集。
