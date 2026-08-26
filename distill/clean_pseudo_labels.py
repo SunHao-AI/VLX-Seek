@@ -369,7 +369,7 @@ def run_pipeline(args: argparse.Namespace, coco: dict) -> dict:
         file_name = file_by_id[image_id]
         if not (image_dir / file_name).is_file():
             missing_images.add(image_id)
-            continue
+        # 缺图框同样计入 total：处理时瞬时落盘并推进进度，使 postfix 计数与进度条口径一致
         pending_total += sum(1 for a in anns if needs_verify(file_name, a))
 
     verifier = VLMVerifier(
@@ -466,6 +466,7 @@ def run_pipeline(args: argparse.Namespace, coco: dict) -> dict:
                     "elapsed_ms": 0,
                 })
                 counters["error_keep"] += 1
+                inner.update(1)  # 缺图框推进内层进度，避免 postfix 计数与进度条脱节
             continue
 
         if not todo:
