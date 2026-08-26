@@ -185,12 +185,15 @@ def crop_encode(
     bbox_xywh: list[float],
     min_crop_pad: float = 0.12,
     max_side: int = 512,
-) -> bytes:
+) -> tuple[bytes, tuple[int, int, int, int]]:
     """按框裁剪局部小图并编码为 JPEG 字节流。
 
     - 外扩 ``min_crop_pad × max(w, h)``；最小边不足 32px 时以中心扩展至 32px；
       越界部分钳制到图像边界。
     - 最长边超过 ``max_side`` 时等比缩小。
+
+    返回 ``(jpeg 字节流, 目标框在裁剪图局部坐标系的 xywh)``。局部坐标已随裁剪图
+    等比缩放并钳制到裁剪图范围内（像素整数），供注入 VLM 提示词聚焦框内目标。
     """
     x, y, w, h = bbox_xywh
     pad = min_crop_pad * max(w, h)
@@ -203,18 +206,62 @@ def crop_encode(
     right = min(img_w, int(round(cx + cw / 2)))
     bottom = min(img_h, int(round(cy + ch / 2)))
     crop = image.crop((left, top, right, bottom))
+    scale = 1.0
     if max(crop.size) > max_side:
         scale = max_side / max(crop.size)
         crop = crop.resize(
             (max(1, round(crop.width * scale)), max(1, round(crop.height * scale)))
         )
+    # 目标框坐标自原图换算到裁剪图局部坐标系（含缩放），供提示词注入
+    bx = (x - left) * scale
+    by = (y - top) * scale
+    bw = w * scale
+    bh = h * scale
+    crop_w, crop_h = crop.size
+    bx = max(0, min(crop_w, round(bx)))
+    by = max(0, min(crop_h, round(by)))
+    bw = max(1, min(crop_w - bx, round(bw)))
+    bh = max(1, min(crop_h - by, round(bh)))
     buf = io.BytesIO()
     crop.save(buf, format="JPEG", quality=85)
-    return buf.getvalue()
+    return buf.getvalue(), (bx, by, bw, bh)
 
 
 SYSTEM_PROMPT = '你是严格的图像内容审核助手，只回答"是"或"否"。'
-USER_PROMPT = '这张从大图裁出的局部区域中，主要拍摄对象是否属于类别「{name}」？只回答"是"或"否"。'
+# 注入目标框在裁剪图局部坐标系的 xywh，引导模型聚焦框内目标而非整张裁剪小图
+USER_PROMPT = ('这张从大图裁出的局部区域中，矩形框(x={x}, y={y}, w={w}, h={h})'
+               '内的主要拍摄对象是否属于类别「{name}」？只回答"是"或"否"。')
+LEGACY_USER_PROMPT = '这张从大图裁出的局部区域中，主要拍摄对象是否属于类别「{name}」？只回答"是"或"否"。'
+
+
+def classify_reply(reply: str) -> str:
+    """把模型回复归类为 keep / delete / error_keep；无法归类返回空串（交由上层重试）。
+
+    兼容真实模型自然表述：「属于/对/符合」→ keep；「不属于/不是/否」→ delete；
+    「无法判断/不确定/看不清/多个目标」等 → error_keep（fail-open 保守保留）。
+    """
+    # 去掉首尾空白与常见中英文标点，避免 "是。"、"「否」"、"不确定……" 被误判
+    r = reply.strip().strip(" \t\n\r。．！？!?，,、;；:：'\"“”‘’（）()[]【】《》")
+    if not r:
+        return ""
+    # 模型明确表示无法判断 → 直接保守保留（fail-open），不再盲目重试
+    UNCERTAIN = (
+        "无法判断", "无法确定", "无法回答", "无法分辨", "无法识别",
+        "不确定", "不能确定", "不能判断", "不清楚", "看不清", "看不太清",
+        "信息不足", "不知道", "判断不出", "无法", "多个目标", "多个物体",
+        "不只一个", "可能是", "也许",
+    )
+    if any(k in r for k in UNCERTAIN):
+        return "error_keep"
+    # 否定优先（"不属于/不是" 含 "属于/是"，必须先判否定）
+    NEGATIVE = ("不属于", "不是", "并非", "并不属于", "不属于该类别", "否")
+    if r.startswith(("不", "否", "非", "没")) or any(k in r for k in NEGATIVE):
+        return "delete"
+    # 肯定
+    POSITIVE = ("属于", "是", "对", "符合", "就是", "确属", "正确", "应该", "确实是", "属于该类别")
+    if any(k in r for k in POSITIVE):
+        return "keep"
+    return ""
 
 
 class ServiceUnreachable(Exception):
@@ -250,9 +297,23 @@ class VLMVerifier:
         self._post = requests.post
         self._conn_error_cls = requests.exceptions.ConnectionError
 
-    def verify(self, image_bytes: bytes, category_name: str) -> tuple[str, str, int]:
-        """验证单框。返回 (verdict, raw_reply, elapsed_ms)，失败耗尽重试后 fail-open。"""
+    def verify(
+        self,
+        image_bytes: bytes,
+        category_name: str,
+        target_box: tuple[int, int, int, int] | None = None,
+    ) -> tuple[str, str, int]:
+        """验证单框。返回 (verdict, raw_reply, elapsed_ms)，失败耗尽重试后 fail-open。
+
+        ``target_box`` 为目标框在裁剪图局部坐标系的 xywh（可空）；有值时注入提示词，
+        无值则退化为不指定框的通用询问。
+        """
         b64 = base64.b64encode(image_bytes).decode("ascii")
+        if target_box is not None:
+            bx, by, bw, bh = target_box
+            text = USER_PROMPT.format(x=bx, y=by, w=bw, h=bh, name=category_name)
+        else:
+            text = LEGACY_USER_PROMPT.format(name=category_name)
         payload = {
             "model": self.model,
             "temperature": 0,
@@ -264,7 +325,7 @@ class VLMVerifier:
                     "content": [
                         {"type": "image_url",
                          "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
-                        {"type": "text", "text": USER_PROMPT.format(name=category_name)},
+                        {"type": "text", "text": text},
                     ],
                 },
             ],
@@ -284,10 +345,12 @@ class VLMVerifier:
                 if resp.status_code >= 400:
                     raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:200]}")
                 reply = resp.json()["choices"][0]["message"]["content"].strip()
-                if reply.startswith("是"):
-                    return "keep", reply, int((time.perf_counter() - t0) * 1000)
-                if reply.startswith("否"):
-                    return "delete", reply, int((time.perf_counter() - t0) * 1000)
+                verdict = classify_reply(reply)
+                if verdict in ("keep", "delete"):
+                    return verdict, reply, int((time.perf_counter() - t0) * 1000)
+                if verdict == "error_keep":
+                    # 模型明确表示无法判断 → 保守保留（fail-open），不再盲目重试
+                    return "error_keep", reply, int((time.perf_counter() - t0) * 1000)
                 raise ValueError(f"无法解析回复: {reply!r}")
             except Exception as exc:  # noqa: BLE001 网络/HTTP/解析错误统一重试
                 last_err = f"{type(exc).__name__}: {exc}"
@@ -481,11 +544,11 @@ def run_pipeline(args: argparse.Namespace, coco: dict) -> dict:
             continue
         for ann in todo:
             try:
-                data = crop_encode(image, ann["bbox"], args.min_crop_pad, args.max_side)
+                data, box = crop_encode(image, ann["bbox"], args.min_crop_pad, args.max_side)
             except Exception as exc:  # noqa: BLE001 出界反向框/RGBA 存 JPEG 等裁剪失败 fail-open
                 record_error(ann, fname, f"crop failed: {type(exc).__name__}: {exc}")
                 continue
-            future = executor.submit(verifier.verify, data, cat_names[ann["category_id"]])
+            future = executor.submit(verifier.verify, data, cat_names[ann["category_id"]], box)
             inflight.append((future, ann, fname))
             while len(inflight) >= max_inflight:
                 drain(inflight.popleft())

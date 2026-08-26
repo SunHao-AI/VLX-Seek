@@ -287,30 +287,32 @@ class CropEncodeTest(unittest.TestCase):
 
     def test_pad_and_jpeg_output(self):
         # pad = 0.12*90 = 10.8 → 外扩后裁剪边长 ≈112
-        data = crop_encode(self.img500, [120, 90, 90, 90])
+        data, box = crop_encode(self.img500, [120, 90, 90, 90])
         self.assertEqual(data[:2], b"\xff\xd8")  # JPEG 魔数
         self.assertEqual(self._decode(data).size, (112, 112))
         self.assertEqual(self._decode(data).format, "JPEG")
+        # 目标框在裁剪图局部坐标：left=120-(120+45-55.8)=109，top=90-(90+45-55.8)=79
+        self.assertEqual(box, (11, 11, 90, 90))
 
     def test_clamp_to_image_bounds(self):
         # 右下越界 → 钳制后尺寸明显小于完整外扩尺寸且为正
-        im = self._decode(crop_encode(self.img500, [450, 350, 90, 90]))
+        im = self._decode(crop_encode(self.img500, [450, 350, 90, 90])[0])
         self.assertGreater(min(im.size), 0)
         self.assertLess(max(im.size), 112)
 
     def test_min_side_32(self):
         # 小框中心扩展至 ≥32px（位置不贴边，钳制不影响）
-        im = self._decode(crop_encode(self.img500, [100, 100, 5, 5]))
+        im = self._decode(crop_encode(self.img500, [100, 100, 5, 5])[0])
         self.assertGreaterEqual(min(im.size), 32)
 
     def test_max_side_downscale(self):
         big = Image.new("RGB", (1024, 731), (60, 60, 200))
-        im = self._decode(crop_encode(big, [0, 0, 600, 600], min_crop_pad=0, max_side=512))
+        im = self._decode(crop_encode(big, [0, 0, 600, 600], min_crop_pad=0, max_side=512)[0])
         self.assertEqual(max(im.size), 512)
 
     def test_negative_xy_clamped_to_zero(self):
         # 左上越界（负坐标）同样钳制：cx=cy=20，cw=ch=100 → [max(0,-30), min(500,70)) = 70px
-        im = self._decode(crop_encode(self.img500, [-30, -30, 100, 100], min_crop_pad=0))
+        im = self._decode(crop_encode(self.img500, [-30, -30, 100, 100], min_crop_pad=0)[0])
         self.assertEqual(im.size, (70, 70))
 
 
@@ -319,10 +321,11 @@ class _Handler(BaseHTTPRequestHandler):
 
     scenario: list = ["是"]
     calls: int = 0
+    last_request_body: str = ""  # 最近一次请求体（用于断言提示词内容）
 
     def do_POST(self) -> None:
         length = int(self.headers.get("Content-Length") or 0)
-        self.rfile.read(length)
+        _Handler.last_request_body = self.rfile.read(length).decode("utf-8")
         _Handler.calls += 1
         seq = _Handler.scenario
         content = seq.pop(0) if len(seq) > 1 else seq[0]
@@ -360,6 +363,7 @@ class MockVLMBase(unittest.TestCase):
     def setUp(self):
         _Handler.scenario = ["是"]
         _Handler.calls = 0
+        _Handler.last_request_body = ""
 
 
 class VLMVerifierTest(MockVLMBase):
@@ -394,6 +398,27 @@ class VLMVerifierTest(MockVLMBase):
         _Handler.scenario = [500, 500, 500]
         verdict, _, _ = self._verifier(max_retries=2).verify(b"fake-image-bytes", "orange")
         self.assertEqual(verdict, "error_keep")
+
+    def test_prompt_contains_box_coords(self):
+        _Handler.scenario = ["是"]
+        self._verifier().verify(b"fake-image-bytes", "orange", (11, 11, 90, 90))
+        payload = json.loads(_Handler.last_request_body)
+        texts = [c["text"] for c in payload["messages"][1]["content"]
+                 if c.get("type") == "text"]
+        self.assertEqual(len(texts), 1)
+        self.assertIn("矩形框(x=11, y=11, w=90, h=90)", texts[0])
+        self.assertIn("orange", texts[0])
+        self.assertIn("是", texts[0])  # 只回答"是/否"
+
+    def test_prompt_without_box_uses_legacy(self):
+        _Handler.scenario = ["是"]
+        self._verifier().verify(b"fake-image-bytes", "orange")
+        payload = json.loads(_Handler.last_request_body)
+        texts = [c["text"] for c in payload["messages"][1]["content"]
+                 if c.get("type") == "text"]
+        self.assertEqual(len(texts), 1)
+        self.assertNotIn("矩形框", texts[0])
+        self.assertIn("orange", texts[0])
 
     def test_first_request_unreachable_fast_exit(self):
         # 端口 9（discard）通常无监听 → 连接拒绝
