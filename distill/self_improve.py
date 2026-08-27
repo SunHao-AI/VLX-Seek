@@ -117,7 +117,8 @@ def infer_one_image(model, image_path, imgsz: int, conf: float,
     原图 (x-pgx)/scale。越界裁剪到 [0, src] 内, 宽高 < 1px 丢。
     """
     import PIL.Image as _PIL
-    src_w, src_h = _PIL.open(image_path).size
+    with _PIL.open(image_path) as _im:
+        src_w, src_h = _im.size
     scale = min(imgsz / src_w, imgsz / src_h, 1.0)
     pad_x = (imgsz - src_w * scale) / 2
     pad_y = (imgsz - src_h * scale) / 2
