@@ -50,9 +50,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--concurrency", type=int, default=16, help="线程池大小")
     p.add_argument("--iou-threshold", type=float, default=0.55, help="同图同类 NMS 的 IoU 阈值")
     p.add_argument("--no-dedup", action="store_true", help="跳过本地去重阶段")
-    p.add_argument("--max-side", type=int, default=512, help="裁剪图最长边超过则等比缩小")
+    p.add_argument("--max-side", type=int, default=960,
+                   help="裁剪图最长边超过则等比缩小（只缩不放），默认 960")
+    p.add_argument("--min-crop-size", type=int, default=640,
+                   help="裁剪最小边（像素），目标居中；原图任一边小于该值时启动报错")
+    p.add_argument("--box-color", choices=list(BOX_COLORS) + [BOX_COLOR_OFF],
+                   default="red",
+                   help="裁剪图上目标框颜色；off 关闭画框（回退旧 prompt）")
+    p.add_argument("--no-draw-box", action="store_true",
+                   help="等同 --box-color off；兼容入口")
+    # --min-crop-pad 保留解析避免老命令 break，但不再消费（deprecated，-h 隐藏）
     p.add_argument("--min-crop-pad", type=float, default=0.12,
-                   help="裁剪框外扩比例（相对框长边），最小边不足 32px 时中心扩展至 32px")
+                   help=argparse.SUPPRESS)
     p.add_argument("--decision-log", default=None,
                    help="决策日志 JSONL 路径，默认 <output>.decisions.jsonl（断点续跑依据）")
     p.add_argument("--report", default=None, help="统计报告 JSON 输出路径（默认仅终端打印）")
@@ -252,10 +261,16 @@ def crop_decode(
 
 
 SYSTEM_PROMPT = '你是严格的图像内容审核助手，只回答"是"或"否"。'
-# 注入目标框在裁剪图局部坐标系的 xywh，引导模型聚焦框内目标而非整张裁剪小图
-USER_PROMPT = ('这张从大图裁出的局部区域中，矩形框(x={x}, y={y}, w={w}, h={h})'
-               '内的主要拍摄对象是否属于类别「{name}」？只回答"是"或"否"。')
+# 裁剪图上已画 box_color 矩形框；prompt 不再注入数值坐标，避免注意力分歧
+USER_PROMPT = ('这张图中{box_word}矩形框已标注了待审核目标。'
+               '请判断框内的主要拍摄对象是否属于类别「{name}」。'
+               '只回答"是"或"否"。')
 LEGACY_USER_PROMPT = '这张从大图裁出的局部区域中，主要拍摄对象是否属于类别「{name}」？只回答"是"或"否"。'
+
+
+def _box_word(box_color: str) -> str:
+    """按 box_color 返回 prompt 中的颜色词。"""
+    return {'red': '红色', 'yellow': '黄色'}.get(box_color, '')
 
 
 def classify_reply(reply: str) -> str:
@@ -326,16 +341,18 @@ class VLMVerifier:
         image_bytes: bytes,
         category_name: str,
         target_box: tuple[int, int, int, int] | None = None,
+        box_color: str = "red",
     ) -> tuple[str, str, int]:
         """验证单框。返回 (verdict, raw_reply, elapsed_ms)，失败耗尽重试后 fail-open。
 
-        ``target_box`` 为目标框在裁剪图局部坐标系的 xywh（可空）；有值时注入提示词，
-        无值则退化为不指定框的通用询问。
+        ``target_box`` 为目标框在裁剪图局部坐标系的 xywh（可空）；有值时画红框+
+        注入颜色说明后发问；无值则退化为旧通用询问。``box_color`` 不能是 'off'
+        （off 时调用方必须传 target_box=None）。
         """
         b64 = base64.b64encode(image_bytes).decode("ascii")
         if target_box is not None:
-            bx, by, bw, bh = target_box
-            text = USER_PROMPT.format(x=bx, y=by, w=bw, h=bh, name=category_name)
+            word = _box_word(box_color)
+            text = USER_PROMPT.format(box_word=word, name=category_name)
         else:
             text = LEGACY_USER_PROMPT.format(name=category_name)
         payload = {
@@ -417,6 +434,10 @@ def run_pipeline(args: argparse.Namespace, coco: dict) -> dict:
         "model": args.model,
         "coco_json": args.coco_json,
         "iou_threshold": args.iou_threshold,
+        "min_crop_size": args.min_crop_size,
+        "max_side": args.max_side,
+        "box_color": args.box_color,
+        "no_draw_box": args.no_draw_box,
     }
     log_path = Path(args.decision_log)
     prev, reusable = load_previous_decisions(log_path, meta)
@@ -567,12 +588,33 @@ def run_pipeline(args: argparse.Namespace, coco: dict) -> dict:
                 record_error(ann, fname, f"image open failed: {type(exc).__name__}: {exc}")
             continue
         for ann in todo:
-            try:
-                data, box = crop_encode(image, ann["bbox"], args.min_crop_pad, args.max_side)
-            except Exception as exc:  # noqa: BLE001 出界反向框/RGBA 存 JPEG 等裁剪失败 fail-open
-                record_error(ann, fname, f"crop failed: {type(exc).__name__}: {exc}")
-                continue
-            future = executor.submit(verifier.verify, data, cat_names[ann["category_id"]], box)
+            if args.box_color == BOX_COLOR_OFF or args.no_draw_box:
+                # 不画框 → 走 legacy prompt，target_box=None
+                try:
+                    data, _ = crop_decode(
+                        image, ann["bbox"],
+                        min_crop_size=args.min_crop_size,
+                        max_side=args.max_side,
+                        box_color=BOX_COLOR_OFF,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    record_error(ann, fname, f"crop failed: {type(exc).__name__}: {exc}")
+                    continue
+                future = executor.submit(verifier.verify, data, cat_names[ann["category_id"]])
+            else:
+                try:
+                    data, box = crop_decode(
+                        image, ann["bbox"],
+                        min_crop_size=args.min_crop_size,
+                        max_side=args.max_side,
+                        box_color=args.box_color,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    record_error(ann, fname, f"crop failed: {type(exc).__name__}: {exc}")
+                    continue
+                future = executor.submit(
+                    verifier.verify, data, cat_names[ann["category_id"]], box, args.box_color
+                )
             inflight.append((future, ann, fname))
             while len(inflight) >= max_inflight:
                 drain(inflight.popleft())
@@ -662,6 +704,10 @@ def main(argv: list[str] | None = None) -> None:
     )
     if not args.model:
         sys.exit("错误：未指定 --model，且环境变量 CLEAN_VLM_MODEL 未设置")
+    if args.min_crop_size < 1:
+        sys.exit("错误：--min-crop-size 必须 >= 1")
+    if args.max_side < 1:
+        sys.exit("错误：--max-side 必须 >= 1")
 
     # 解析出的具体路径写回 args，供 run_pipeline 直接消费（CLI 未显式指定时为默认值）
     args.output = str(output_path)

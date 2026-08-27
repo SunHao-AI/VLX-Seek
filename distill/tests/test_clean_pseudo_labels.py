@@ -50,7 +50,10 @@ class ParseArgsTest(unittest.TestCase):
         self.assertEqual(args.concurrency, 16)
         self.assertEqual(args.iou_threshold, 0.55)
         self.assertFalse(args.no_dedup)
-        self.assertEqual(args.max_side, 512)
+        self.assertEqual(args.max_side, 960)
+        self.assertEqual(args.min_crop_size, 640)
+        self.assertEqual(args.box_color, "red")
+        self.assertFalse(args.no_draw_box)
         self.assertAlmostEqual(args.min_crop_pad, 0.12)
         self.assertIsNone(args.output)
         self.assertIsNone(args.decision_log)
@@ -401,7 +404,8 @@ class VLMVerifierTest(MockVLMBase):
         self.assertEqual(verdict, "delete")
 
     def test_garbage_exhausts_retries_then_error_keep(self):
-        _Handler.scenario = ["也许吧"]  # 不以是/否开头 → 每次都判失败
+        # "abc" 不在 classify_reply 任一分支, 触发 ValueError → 退避重试直到耗尽
+        _Handler.scenario = ["abc"]
         v = self._verifier(max_retries=2)
         verdict, _, _ = v.verify(b"fake-image-bytes", "orange")
         self.assertEqual(verdict, "error_keep")
@@ -418,16 +422,27 @@ class VLMVerifierTest(MockVLMBase):
         verdict, _, _ = self._verifier(max_retries=2).verify(b"fake-image-bytes", "orange")
         self.assertEqual(verdict, "error_keep")
 
-    def test_prompt_contains_box_coords(self):
+    def test_prompt_red_box_word(self):
         _Handler.scenario = ["是"]
-        self._verifier().verify(b"fake-image-bytes", "orange", (11, 11, 90, 90))
+        self._verifier().verify(b"fake-image-bytes", "orange", (11, 11, 90, 90), box_color="red")
         payload = json.loads(_Handler.last_request_body)
         texts = [c["text"] for c in payload["messages"][1]["content"]
                  if c.get("type") == "text"]
         self.assertEqual(len(texts), 1)
-        self.assertIn("矩形框(x=11, y=11, w=90, h=90)", texts[0])
+        self.assertIn("红色", texts[0])
+        self.assertIn("矩形框已标注了待审核目标", texts[0])
+        self.assertNotIn("x=11, y=11, w=90, h=90", texts[0])
         self.assertIn("orange", texts[0])
-        self.assertIn("是", texts[0])  # 只回答"是/否"
+        self.assertIn('只回答"是"或"否"', texts[0])
+
+    def test_prompt_yellow_box_word(self):
+        _Handler.scenario = ["是"]
+        self._verifier().verify(b"fake-image-bytes", "orange", (11, 11, 90, 90), box_color="yellow")
+        payload = json.loads(_Handler.last_request_body)
+        texts = [c["text"] for c in payload["messages"][1]["content"]
+                 if c.get("type") == "text"]
+        self.assertEqual(len(texts), 1)
+        self.assertIn("黄色", texts[0])
 
     def test_prompt_without_box_uses_legacy(self):
         _Handler.scenario = ["是"]
@@ -452,11 +467,11 @@ def _write_fixture(img_dir: Path) -> Path:
     IoU(ann0, ann1) = 90*90/(10000+10000-8100) ≈ 0.68 > 0.55 → ann1 判 dedup。
     """
     img_dir.mkdir(parents=True, exist_ok=True)
-    Image.new("RGB", (500, 399), (200, 60, 60)).save(img_dir / "img_a.jpg", quality=90)
+    Image.new("RGB", (700, 640), (200, 60, 60)).save(img_dir / "img_a.jpg", quality=90)
     Image.new("RGB", (1024, 731), (60, 120, 200)).save(img_dir / "img_b.jpg", quality=90)
     coco = {
         "images": [
-            {"id": 0, "file_name": "img_a.jpg", "width": 500, "height": 399},
+            {"id": 0, "file_name": "img_a.jpg", "width": 700, "height": 640},
             {"id": 1, "file_name": "img_b.jpg", "width": 1024, "height": 731},
         ],
         "categories": [{"id": 0, "name": "orange"}, {"id": 1, "name": "apple"}],
