@@ -42,19 +42,159 @@ def split_coco_by_image(
     return train_coco, val_coco
 
 
-# 以下为占位 stub,Task 4/5 会替换为真实实现;
-# 占位仅为满足 tests/test_self_improve.py 顶层 import 的接口名。
-def parse_args(argv=None):
-    raise NotImplementedError('Task 4 实现')
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description='自改进迭代: m 整图推理 -> Qwen 清洗 -> 热启动微调(多轮自动)',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    p.add_argument('--init-coco-json', required=True, help='d0 教师伪标签 COCO')
+    p.add_argument('--image-dir', required=True, help='图像目录')
+    p.add_argument('--category-map', required=True,
+                   help='category_prompts.json 路径')
+    p.add_argument('--init-weights', default='yolov8s-worldv2.pt')
+    p.add_argument('--max-rounds', type=int, default=3)
+    p.add_argument('--val-ratio', type=float, default=0.1)
+    p.add_argument('--imgsz', type=int, default=640)
+    p.add_argument('--conf-thresh', type=float, default=0.30)
+    p.add_argument('--nms-iou', type=float, default=0.50)
+    p.add_argument('--epochs', type=int, default=30)
+    p.add_argument('--batch', type=int, default=32)
+    p.add_argument('--optimizer', default='auto')
+    p.add_argument('--lr0', type=float, default=None)
+    p.add_argument('--train-device', default='0')
+    p.add_argument('--infer-device', default='0')
+    p.add_argument('--patience', type=int, default=30)
+
+    # 清洗(透传 clean_pseudo_labels.parse_args)
+    p.add_argument('--clean-base-url', default='http://127.0.0.1:8101/v1')
+    p.add_argument('--model', default=None,
+                   help='VLM served-model-name, e.g. qwen3.8-vllm')
+    p.add_argument('--api-key', default=None)
+    p.add_argument('--clean-concurrency', type=int, default=16)
+    p.add_argument('--min-crop-size', type=int, default=640)
+    p.add_argument('--max-side', type=int, default=960)
+    p.add_argument('--box-color', default='red')
+
+    # 调度
+    p.add_argument('--run-dir', required=True)
+    p.add_argument('--early-stop-no-improve', type=int, default=2)
+    p.add_argument('--ap-drop-alert', type=float, default=0.20)
+    p.add_argument('--ap-drop-window', type=int, default=2)
+    p.add_argument('--skip-clean', action='store_true')
+    p.add_argument('--model-provider', default=None,
+                   help='测试后门: "module.ClassName"; 不传走 ultralytics')
+    return p.parse_args(argv)
 
 
-def load_category_map(path):
-    raise NotImplementedError('Task 4 实现')
+def load_category_map(path: str) -> tuple[list[str], dict[str, int], dict[str, str]]:
+    """加载 category_prompts.json, 返回 (names_list, train_to_cid, cn_to_train)。
+
+    names_list 的 index = category_id = `coco["categories"]` 的 index(同 COCO 顺序)。
+    """
+    with open(path, encoding='utf-8') as f:
+        data = json.load(f)
+    cats = data.get('categories', {})
+    names_list: list[str] = []
+    cn_to_train: dict[str, str] = {}
+    train_to_cid: dict[str, int] = {}
+    for cid, (cn, entry) in enumerate(cats.items()):
+        names_list.append(cn)
+        train = str(entry.get('train_name', '')).strip()
+        if not train:
+            continue
+        cn_to_train.setdefault(cn, train)
+        train_to_cid.setdefault(train, cid)
+    return names_list, train_to_cid, cn_to_train
 
 
-def infer_one_image(model, image_path, imgsz, conf, iou):
-    raise NotImplementedError('Task 4 实现')
+def infer_one_image(model, image_path, imgsz: int, conf: float,
+                    iou: float) -> list[tuple[int, float, float, float, float]]:
+    """对单张图推理, 返回 [(cls_idx, x, y, w, h), ...](原图像素)。
+
+    letterbox 反算: ultralytics `model.predict` 出的 `boxes.xyxy` 在 letterbox
+    域; 输入 src_w × src_h → scale = min(imgsz/w, imgsz/h, 1.0), 居中 pad:
+    pad_x = (imgsz - src_w*scale)/2, pad_y = (imgsz - src_h*scale)/2,
+    原图 (x-pgx)/scale。越界裁剪到 [0, src] 内, 宽高 < 1px 丢。
+    """
+    import PIL.Image as _PIL
+    src_w, src_h = _PIL.open(image_path).size
+    scale = min(imgsz / src_w, imgsz / src_h, 1.0)
+    pad_x = (imgsz - src_w * scale) / 2
+    pad_y = (imgsz - src_h * scale) / 2
+
+    def _f(v) -> float:
+        try:
+            return float(v.item())
+        except AttributeError:
+            return float(v)
+
+    result = model.predict(image_path, imgsz=imgsz, conf=conf, iou=iou,
+                           device='0', verbose=False)
+    boxes = result[0].boxes
+    xyxy = getattr(boxes, 'xyxy', None)
+    n = getattr(xyxy, 'shape', (None,))[0]
+    if n is None:
+        n = len(xyxy)
+    if boxes is None or xyxy is None or n == 0:
+        return []
+    out: list[tuple[int, float, float, float, float]] = []
+    for xy, cls in zip(boxes.xyxy, boxes.cls):
+        cid = int(_f(cls))
+        x1 = _f(xy[0]); y1 = _f(xy[1]); x2 = _f(xy[2]); y2 = _f(xy[3])
+        ox1 = max(0.0, (x1 - pad_x) / scale)
+        oy1 = max(0.0, (y1 - pad_y) / scale)
+        ox2 = min(src_w, (x2 - pad_x) / scale)
+        oy2 = min(src_h, (y2 - pad_y) / scale)
+        w = ox2 - ox1
+        h = oy2 - oy1
+        if w < 1 or h < 1:
+            continue
+        out.append((cid, ox1, oy1, w, h))
+    return out
 
 
-def build_round_coco(image_paths, preds_by_image, names_list):
-    raise NotImplementedError('Task 4 实现')
+def build_round_coco(image_paths: list, preds_by_image: dict,
+                     names_list: list[str]) -> dict:
+    """纯函数: 图像组预测 → COCO。调用方负责 save_coco 落盘。"""
+    coco: dict = {
+        'images': [
+            {'id': i, 'file_name': p.name} for i, p in enumerate(image_paths)
+        ],
+        'categories': [
+            {'id': i, 'name': n} for i, n in enumerate(names_list)
+        ],
+        'annotations': [],
+    }
+    ann_id = 0
+    for img_id, p in enumerate(image_paths):
+        for cid, x, y, w, h in preds_by_image.get(p, []):
+            coco['annotations'].append({
+                'id': ann_id,
+                'image_id': img_id,
+                'category_id': cid,
+                'bbox': [x, y, w, h],
+                'area': w * h,
+                'iscrowd': 0,
+            })
+            ann_id += 1
+    return coco
+
+
+def _resolve_model_provider_args(args):
+    """返回 callable(checkpoint) -> model 实例。
+
+    生产不传 --model-provider → 走 `ultralytics.YOLOWorld`。
+    测试传 'distill.tests.test_self_improve.FakeYOLOWorld' → importlib 注入。
+    """
+    if args.model_provider:
+        import importlib
+        mod_name, _, cls_name = args.model_provider.rpartition('.')
+        if not mod_name or not cls_name:
+            raise ValueError(
+                f'--model-provider {args.model_provider!r} 必须为 "module.ClassName"'
+            )
+        mod = importlib.import_module(mod_name)
+        cls = getattr(mod, cls_name)
+        return lambda ckpt: cls(ckpt)
+    from ultralytics import YOLOWorld
+    return YOLOWorld

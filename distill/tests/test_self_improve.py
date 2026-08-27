@@ -162,5 +162,94 @@ class FakeYOLOWorld:
         return FakeResultsVal()
 
 
+class LoadCategoryMapTest(unittest.TestCase):
+    def test_three_indexes(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+        p = root / 'category_prompts.json'
+        p.write_text(json.dumps({
+            'categories': {
+                'orange': {'train_name': 'loud orange fruit'},
+                'apple': {'train_name': 'red apple fruit'},
+            }
+        }), encoding='utf-8')
+        names_list, train_to_cid, cn_to_train = load_category_map(p)
+        self.assertEqual(names_list, ['orange', 'apple'])
+        self.assertEqual(train_to_cid, {
+            'loud orange fruit': 0,
+            'red apple fruit': 1,
+        })
+        self.assertEqual(cn_to_train, {
+            'orange': 'loud orange fruit',
+            'apple': 'red apple fruit',
+        })
+
+
+class ParseArgsTest(unittest.TestCase):
+    def _required(self, root: Path) -> list[str]:
+        return [
+            '--init-coco-json', str(root / 'in.json'),
+            '--image-dir', str(root / 'imgs'),
+            '--category-map', str(root / 'category_prompts.json'),
+            '--run-dir', str(root / 'run'),
+        ]
+
+    def test_defaults(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+        args = parse_args(self._required(root) + ['--model', 'mock-model'])
+        self.assertEqual(args.max_rounds, 3)
+        self.assertAlmostEqual(args.val_ratio, 0.1)
+        self.assertEqual(args.imgsz, 640)
+        self.assertAlmostEqual(args.conf_thresh, 0.30)
+        self.assertAlmostEqual(args.nms_iou, 0.50)
+        self.assertEqual(args.early_stop_no_improve, 2)
+        self.assertEqual(args.init_weights, 'yolov8s-worldv2.pt')
+        self.assertFalse(args.skip_clean)
+        self.assertEqual(args.box_color, 'red')
+        self.assertEqual(args.min_crop_size, 640)
+
+
+class InferOneImageTest(unittest.TestCase):
+    def test_letterbox_no_scale(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+        _tiny_coco_and_images(root)
+        img = root / 'imgs' / 'a.jpg'
+        model = FakeYOLOWorld()
+        preds = infer_one_image(model, img, imgsz=640, conf=0.1, iou=0.5)
+        self.assertEqual(preds, [(0, 40.0, 50.0, 100.0, 100.0)])
+
+    def test_letterbox_downscale(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+        (root / 'imgs').mkdir(parents=True, exist_ok=True)
+        Image.new('RGB', (1280, 640), (1, 2, 3)).save(root / 'imgs' / 'big.jpg',
+                                                       quality=90)
+        img = root / 'imgs' / 'big.jpg'
+
+        # letterbox 域 640x640 正方形, 内容 640x320 (scale=0.5) 居中 →
+        # pad_x=0, pad_y=(640-640*0.5)/2=160, 内容 y 范围 [160, 480]。
+        class _PatchModel:
+            """只覆写 predict, 返回指定 box(覆盖 FakeYOLOWorld 的固定 box)。"""
+            def __init__(self, box):
+                self._box = box
+            def predict(self, source, imgsz=None, conf=None, iou=None,
+                        device=None, verbose=None, **kw):
+                return [FakeResult(self._box, 0, 0.7)]
+
+        # ① box 落在 letterbox 内容区(200,300 都 >= 160): 反算 should 得到原图像素
+        #   ox=(x-0)/0.5: (40..140)/0.5 = 80..280 (w=200)
+        #   oy=(y-160)/0.5: (200..300)/… = (40..140)/0.5 = 80..280 (h=200)
+        preds = infer_one_image(_PatchModel((40.0, 200.0, 140.0, 300.0)),
+                                img, imgsz=640, conf=0.1, iou=0.5)
+        self.assertEqual(preds, [(0, 80.0, 80.0, 200.0, 200.0)])
+
+        # ② box 完全落在 pad 区(40..150 都 < 160): 反算 oy2<0,h<1 → 丢
+        preds2 = infer_one_image(_PatchModel((40.0, 50.0, 140.0, 150.0)),
+                                 img, imgsz=640, conf=0.1, iou=0.5)
+        self.assertEqual(preds2, [])
+
+
 if __name__ == '__main__':
     unittest.main()
