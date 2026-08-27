@@ -25,7 +25,7 @@ from clean_pseudo_labels import (  # noqa: E402
     DecisionLog,
     ServiceUnreachable,
     VLMVerifier,
-    crop_encode,
+    crop_decode,
     dedup_annotations,
     iou_xywh,
     load_previous_decisions,
@@ -275,9 +275,11 @@ class DedupAnnotationsTest(unittest.TestCase):
         self.assertEqual([a["id"] for a in kept], [0, 2, 3])
 
 
-class CropEncodeTest(unittest.TestCase):
+class CropDecodeTest(unittest.TestCase):
     def setUp(self):
-        self.img500 = Image.new("RGB", (500, 399), (120, 40, 40))
+        self.img_small = Image.new('RGB', (640, 640), (120, 40, 40))
+        self.img_mid = Image.new('RGB', (1000, 1000), (200, 60, 60))
+        self.img_big = Image.new('RGB', (4000, 3000), (60, 60, 200))
 
     @staticmethod
     def _decode(data: bytes) -> Image.Image:
@@ -285,35 +287,52 @@ class CropEncodeTest(unittest.TestCase):
         im.load()
         return im
 
-    def test_pad_and_jpeg_output(self):
-        # pad = 0.12*90 = 10.8 → 外扩后裁剪边长 ≈112
-        data, box = crop_encode(self.img500, [120, 90, 90, 90])
-        self.assertEqual(data[:2], b"\xff\xd8")  # JPEG 魔数
-        self.assertEqual(self._decode(data).size, (112, 112))
-        self.assertEqual(self._decode(data).format, "JPEG")
-        # 目标框在裁剪图局部坐标：left=120-(120+45-55.8)=109，top=90-(90+45-55.8)=79
-        self.assertEqual(box, (11, 11, 90, 90))
+    def test_small_target_small_image(self):
+        data, box = crop_decode(self.img_small, [0, 0, 100, 100],
+                                min_crop_size=640, max_side=960)
+        self.assertEqual(self._decode(data).size, (640, 640))
+        self.assertEqual(box, (0, 0, 100, 100))
 
-    def test_clamp_to_image_bounds(self):
-        # 右下越界 → 钳制后尺寸明显小于完整外扩尺寸且为正
-        im = self._decode(crop_encode(self.img500, [450, 350, 90, 90])[0])
-        self.assertGreater(min(im.size), 0)
-        self.assertLess(max(im.size), 112)
+    def test_small_target_mid_image(self):
+        data, box = crop_decode(self.img_mid, [0, 0, 100, 100],
+                                min_crop_size=640, max_side=960)
+        self.assertEqual(self._decode(data).size, (640, 640))
+        self.assertEqual(box, (0, 0, 100, 100))
 
-    def test_min_side_32(self):
-        # 小框中心扩展至 ≥32px（位置不贴边，钳制不影响）
-        im = self._decode(crop_encode(self.img500, [100, 100, 5, 5])[0])
-        self.assertGreaterEqual(min(im.size), 32)
+    def test_mid_target_mid_image_no_downscale(self):
+        # [100,200,400,300] 中心 (300, 350), 窗口 640x640 → left=max(0, -20)=0,
+        # top=max(0, 30)=30, 窗口 [0, 30, 640, 670]; 不缩; 局部 (100, 170, 400, 300)
+        data, box = crop_decode(self.img_mid, [100, 200, 400, 300],
+                                min_crop_size=640, max_side=960)
+        im = self._decode(data)
+        self.assertEqual(im.size, (640, 640))
+        self.assertEqual(box, (100, 170, 400, 300))
 
-    def test_max_side_downscale(self):
-        big = Image.new("RGB", (1024, 731), (60, 60, 200))
-        im = self._decode(crop_encode(big, [0, 0, 600, 600], min_crop_pad=0, max_side=512)[0])
-        self.assertEqual(max(im.size), 512)
+    def test_large_target_triggers_downscale(self):
+        # [1000,800,2000,1500] 中心 (2000,1550), 窗口 2000x1500 → 窗口 [1000,800,3000,2300]
+        # size=(2000,1500), max_side=960 → scale=960/2000=0.48 → resize=(960,720)
+        # 局部 box = (0, 0, 960, 720)
+        data, box = crop_decode(self.img_big, [1000, 800, 2000, 1500],
+                                min_crop_size=640, max_side=960)
+        im = self._decode(data)
+        self.assertEqual((im.size), (960, 720))
+        self.assertEqual(box, (0, 0, 960, 720))
 
-    def test_negative_xy_clamped_to_zero(self):
-        # 左上越界（负坐标）同样钳制：cx=cy=20，cw=ch=100 → [max(0,-30), min(500,70)) = 70px
-        im = self._decode(crop_encode(self.img500, [-30, -30, 100, 100], min_crop_pad=0)[0])
-        self.assertEqual(im.size, (70, 70))
+    def test_image_smaller_than_min_raises(self):
+        tiny = Image.new('RGB', (500, 500), (1, 2, 3))
+        with self.assertRaises(ValueError):
+            crop_decode(tiny, [10, 10, 100, 100], min_crop_size=640, max_side=960)
+
+    def test_yellow_box_color(self):
+        data, box = crop_decode(self.img_small, [0, 0, 100, 100],
+                                min_crop_size=640, max_side=960, box_color='yellow')
+        self.assertEqual(self._decode(data).size, (640, 640))
+        self.assertEqual(box, (0, 0, 100, 100))
+
+    def test_invalid_box_color_raises(self):
+        with self.assertRaises(ValueError):
+            crop_decode(self.img_small, [0, 0, 100, 100],
+                        min_crop_size=640, max_side=960, box_color='blue')
 
 
 class _Handler(BaseHTTPRequestHandler):

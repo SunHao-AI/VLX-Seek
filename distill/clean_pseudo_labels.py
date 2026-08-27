@@ -180,39 +180,56 @@ def dedup_annotations(coco: dict, threshold: float) -> tuple[list[dict], list[di
     return kept, dedup_records
 
 
-def crop_encode(
+BOX_COLORS = {'red': (255, 0, 0), 'yellow': (255, 255, 0)}
+BOX_COLOR_OFF = 'off'
+
+
+def crop_decode(
     image: Image.Image,
     bbox_xywh: list[float],
-    min_crop_pad: float = 0.12,
-    max_side: int = 512,
+    min_crop_size: int = 640,
+    max_side: int = 960,
+    box_color: str = 'red',
 ) -> tuple[bytes, tuple[int, int, int, int]]:
-    """按框裁剪局部小图并编码为 JPEG 字节流。
+    """以目标为中心裁剪, 边长取 max(原框, min_crop_size), 越界反推(借鉴 cv_utils.crop_rect)。
 
-    - 外扩 ``min_crop_pad × max(w, h)``；最小边不足 32px 时以中心扩展至 32px；
-      越界部分钳制到图像边界。
-    - 最长边超过 ``max_side`` 时等比缩小。
+    送 VLM 前在裁剪图上画 box_color 矩形框(4px)引导注意力; 最长边 > max_side
+    等比缩小(只缩不放, 坐标同步换算, 钳制到裁剪图内)。
 
-    返回 ``(jpeg 字节流, 目标框在裁剪图局部坐标系的 xywh)``。局部坐标已随裁剪图
-    等比缩放并钳制到裁剪图范围内（像素整数），供注入 VLM 提示词聚焦框内目标。
+    Returns:
+        (JPEG 字节流, 目标框在裁剪图局部坐标系的 xywh 像素整数)。
+
+    Raises:
+        ValueError: 当 image 任一边 < min_crop_size, 或 box_color 非法。
     """
+    if box_color not in BOX_COLORS and box_color != BOX_COLOR_OFF:
+        raise ValueError(f'非法 box_color: {box_color!r}, 可选 {list(BOX_COLORS) + [BOX_COLOR_OFF]}')
     x, y, w, h = bbox_xywh
-    pad = min_crop_pad * max(w, h)
-    cw = max(w + 2 * pad, 32.0)
-    ch = max(h + 2 * pad, 32.0)
-    cx, cy = x + w / 2, y + h / 2
     img_w, img_h = image.size
+    if img_w < min_crop_size or img_h < min_crop_size:
+        raise ValueError(
+            f'图像 {img_w}x{img_h} 小于 min_crop_size={min_crop_size}, 无法保证 '
+            f'{min_crop_size}x{min_crop_size} 上下文; 请上扬图源或减小 --min-crop-size'
+        )
+    # 1) 计算裁剪窗口: 撑到 min_crop_size, 越界反推(借鉴 cv_utils.crop_rect)
+    cw = max(int(round(w)), min_crop_size)
+    ch = max(int(round(h)), min_crop_size)
+    cx, cy = x + w / 2, y + h / 2
     left = max(0, int(round(cx - cw / 2)))
     top = max(0, int(round(cy - ch / 2)))
-    right = min(img_w, int(round(cx + cw / 2)))
-    bottom = min(img_h, int(round(cy + ch / 2)))
+    right = min(img_w, left + cw)
+    bottom = min(img_h, top + ch)
+    left = right - cw
+    top = bottom - ch
     crop = image.crop((left, top, right, bottom))
+    # 2) 只缩不放: 最长边超 max_side 等比缩
     scale = 1.0
     if max(crop.size) > max_side:
         scale = max_side / max(crop.size)
         crop = crop.resize(
             (max(1, round(crop.width * scale)), max(1, round(crop.height * scale)))
         )
-    # 目标框坐标自原图换算到裁剪图局部坐标系（含缩放），供提示词注入
+    # 3) 目标框局部坐标(换算 + 钳制) + 画框
     bx = (x - left) * scale
     by = (y - top) * scale
     bw = w * scale
@@ -222,9 +239,16 @@ def crop_encode(
     by = max(0, min(crop_h, round(by)))
     bw = max(1, min(crop_w - bx, round(bw)))
     bh = max(1, min(crop_h - by, round(bh)))
+    if box_color != BOX_COLOR_OFF:
+        from PIL import ImageDraw
+        draw = ImageDraw.Draw(crop)
+        outline = BOX_COLORS[box_color]
+        for i in range(4):  # 4px 线宽
+            draw.rectangle([bx + i, by + i, bx + bw - i - 1, by + bh - i - 1], outline=outline)
+    # 4) JPEG 编码
     buf = io.BytesIO()
-    crop.save(buf, format="JPEG", quality=85)
-    return buf.getvalue(), (bx, by, bw, bh)
+    crop.save(buf, format='JPEG', quality=85)
+    return buf.getvalue(), (int(bx), int(by), int(bw), int(bh))
 
 
 SYSTEM_PROMPT = '你是严格的图像内容审核助手，只回答"是"或"否"。'
