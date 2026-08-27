@@ -155,11 +155,20 @@ def infer_one_image(model, image_path, imgsz: int, conf: float,
 
 def build_round_coco(image_paths: list, preds_by_image: dict,
                      names_list: list[str]) -> dict:
-    """纯函数: 图像组预测 → COCO。调用方负责 save_coco 落盘。"""
+    """纯函数: 图像组预测 → COCO。调用方负责 save_coco 落盘。
+
+    images 同时填 width/height 从 PIL 读, 让下游 prepare_dataset 走
+    coco_to_yolo_txt 不需要再做一次读尺寸(下游对缺 width/height 会 KeyError)。
+    """
+    import PIL.Image as _PIL
+    images: list[dict] = []
+    for i, p in enumerate(image_paths):
+        with _PIL.open(p) as _im:
+            _w, _h = _im.size
+        images.append({'id': i, 'file_name': p.name,
+                       'width': _w, 'height': _h})
     coco: dict = {
-        'images': [
-            {'id': i, 'file_name': p.name} for i, p in enumerate(image_paths)
-        ],
+        'images': images,
         'categories': [
             {'id': i, 'name': n} for i, n in enumerate(names_list)
         ],
@@ -198,3 +207,313 @@ def _resolve_model_provider_args(args):
         return lambda ckpt: cls(ckpt)
     from ultralytics import YOLOWorld
     return YOLOWorld
+
+
+def build_dataset_yaml(
+    train_coco: dict, val_coco: dict, image_dir: str, dataset_root: Path,
+    category_map_path: str,
+) -> Path:
+    """复用 distill.finetune_yolo_world.prepare_dataset, 传 train+val_coco。
+    val_ratio/seed 形式上必须传(val_coco 非 None 时 split 分支不调)。"""
+    from distill.finetune_yolo_world import prepare_dataset as _pd
+    return _pd(
+        coco=train_coco,
+        image_dir=image_dir,
+        output_dir=str(dataset_root),
+        val_coco=val_coco,
+        val_ratio=0.0,
+        seed=42,
+        category_map=category_map_path,
+    )
+
+
+def train_direct(model, dataset_yaml: str, epochs: int, batch: int,
+                 device: str, optimizer: str, lr0: float | None,
+                 imgsz: int, project: str, name: str, patience: int):
+    """薄封装 ultralytics YOLOWorld.train()。"""
+    kwargs = dict(
+        data=dataset_yaml, epochs=epochs, imgsz=imgsz, batch=batch,
+        device=device, optimizer=optimizer, patience=patience,
+        project=project, name=name, exist_ok=True, plots=True,
+        seed=42,
+    )
+    if lr0 is not None:
+        kwargs['lr0'] = lr0
+    return model.train(**kwargs)
+
+
+def collect_eval_metrics(model, dataset_yaml: str, imgsz: int,
+                         conf: float, iou: float, names: list[str]) -> dict:
+    """YOLOWorld.val() → mAP / mAP50 / 每类 AP(ap50_95)。"""
+    results = model.val(data=dataset_yaml, imgsz=imgsz, conf=conf, iou=iou,
+                        verbose=False)
+    box = results.box
+    ap5095 = list(box.ap50_95) if hasattr(box, 'ap50_95') else [0.0] * len(names)
+    return {
+        'mAP': float(box.map),
+        'mAP50': float(box.map50),
+        'ap_per_class': {n: float(ap) for n, ap in zip(names, ap5095)},
+    }
+
+
+def _copy_path(src: Path, dst: Path) -> None:
+    import shutil
+    src, dst = Path(src), Path(dst)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, dst)
+
+
+def _store_config(args, run_dir: Path) -> None:
+    p = run_dir / 'config.json'
+    if p.is_file():
+        return
+    p.write_text(json.dumps(vars(args), ensure_ascii=False, indent=2),
+                 encoding='utf-8')
+
+
+def _load_summary(run_dir: Path) -> list[dict]:
+    p = run_dir / 'summary.json'
+    if not p.is_file():
+        return []
+    return json.loads(p.read_text())['rounds']
+
+
+def _store_summary(run_dir: Path, rounds: list[dict],
+                   final_model: str | None, early_stopped: bool) -> None:
+    p = run_dir / 'summary.json'
+    p.write_text(json.dumps({
+        'rounds': rounds,
+        'final_model': final_model,
+        'early_stopped': early_stopped,
+    }, ensure_ascii=False, indent=2), encoding='utf-8')
+
+
+def _alert_per_class_drop(rounds: list[dict], thr: float,
+                          window: int) -> None:
+    """若某类连续 `window` 轮 AP 跌 > thr * 前值, 告警(不终止)。"""
+    if len(rounds) < window + 1:
+        return
+    tail = rounds[-(window + 1):]
+    by_class: dict[str, list[float]] = {}
+    for r in tail:
+        for cname, ap in r.get('ap_per_class', {}).items():
+            by_class.setdefault(cname, []).append(ap)
+    for cname, series in by_class.items():
+        base = series[0]
+        if base <= 0.05:
+            continue
+        cur = series[-1]
+        if cur < base * (1 - thr):
+            print(f'!! [告警] 类别「{cname}」连续 {window} 轮 AP '
+                  f'{base:.4f} → {cur:.4f}(跌 {(1 - cur / base) * 100:.1f}%)')
+
+
+def run_round(args, run_dir: Path, k: int, prev_pt: str | None,
+              store: dict) -> dict:
+    """第 k 轮: k=0 仅 D/E(用教师 d0); k>0 B→C→D→E。幂等。"""
+    round_dir = run_dir / f'round_{k}'
+    round_dir.mkdir(parents=True, exist_ok=True)
+    names = store['names_list']
+
+    # ---- B 推理(k=0 跳过)
+    raw_path = round_dir / f'raw_d{k}.json'
+    if k == 0:
+        print(f'[round 0] B: 跳过(直接用教师 d0)')
+    elif raw_path.is_file():
+        print(f'[round {k}] B: raw_d{k} 已存在, 跳过推理')
+    else:
+        image_paths = store['image_paths']
+        model = store['model'](str(Path(run_dir) / prev_pt) if prev_pt
+                               else args.init_weights)
+        preds: dict = {}
+        for p in image_paths:
+            preds[p] = infer_one_image(model, p, args.imgsz,
+                                       args.conf_thresh, args.nms_iou)
+        raw_coco = build_round_coco(image_paths, preds, names)
+        save_coco(raw_coco, raw_path)
+        print(f'[round {k}] B: {len(raw_coco["annotations"])} 框 → {raw_path.name}')
+
+    # ---- C 清洗(k=0 跳过)
+    clean_path = round_dir / f'clean_d{k}.json'
+    if k == 0:
+        print(f'[round 0] C: 跳过(直接用教师 d0)')
+    elif args.skip_clean:
+        if not clean_path.is_file():
+            save_coco(load_coco(raw_path), clean_path)
+    elif clean_path.is_file():
+        print(f'[round {k}] C: clean_d{k} 已存在, 跳过清洗')
+    else:
+        decision_log = round_dir / f'decisions_d{k}.jsonl'
+        from distill.clean_pseudo_labels import parse_args as _pa_clean, run_pipeline as _run_clean
+        cargs = _pa_clean([
+            '--coco-json', str(raw_path),
+            '--image-dir', str(store['image_dir']),
+            '--output', str(clean_path),
+            '--decision-log', str(decision_log),
+            '--model', args.model,
+            '--base-url', args.clean_base_url,
+            '--concurrency', str(args.clean_concurrency),
+            '--min-crop-size', str(args.min_crop_size),
+            '--max-side', str(args.max_side),
+            '--box-color', args.box_color,
+        ])
+        if args.api_key:
+            cargs.api_key = args.api_key
+        report = _run_clean(cargs, load_coco(raw_path))
+        print(f'[round {k}] C: keep={report.get("kept")} '
+              f'delete={report.get("vlm_removed")} '
+              f'dedup={report.get("dedup_removed")} '
+              f'error_keep={report.get("error_keep")}')
+
+    # ---- D 训练(从 prev 热启动; k>0 用 clean_d_k train 子集; k==0 用 split_train)
+    model_out = round_dir / (f'm{k}.pt' if k > 0 else 'm0.pt')
+    if model_out.is_file():
+        print(f'[round {k}] D: {model_out.name} 已存在, 跳过训练')
+    else:
+        if k == 0:
+            train_coco_for_train = store['train_coco']
+        else:
+            train_coco_for_train, _ = split_coco_by_image(
+                load_coco(clean_path), val_ratio=args.val_ratio, seed=42
+            )
+        val_coco = load_coco(store['val_coco_path'])
+        dataset_root = round_dir / 'dataset_root'
+        train_yaml = build_dataset_yaml(
+            train_coco=train_coco_for_train,
+            val_coco=val_coco,
+            image_dir=str(store['image_dir']),
+            dataset_root=dataset_root,
+            category_map_path=args.category_map,
+        )
+        src_weights = (
+            Path(run_dir) / prev_pt if prev_pt
+            else Path(args.init_weights)
+        )
+        model = store['model'](str(src_weights))
+        train_direct(
+            model=model,
+            dataset_yaml=str(train_yaml),
+            epochs=args.epochs,
+            batch=args.batch,
+            device=args.train_device,
+            optimizer=args.optimizer,
+            lr0=args.lr0,
+            imgsz=args.imgsz,
+            project=str(round_dir),
+            name='yolo_world',
+            patience=args.patience,
+        )
+        # 归档 best.pt(若缺回退 last.pt)
+        best_pt = Path(round_dir) / 'yolo_world' / 'best.pt'
+        if not best_pt.is_file():
+            last_pt = Path(round_dir) / 'yolo_world' / 'last.pt'
+            if not last_pt.is_file():
+                raise FileNotFoundError(
+                    f'round {k}: 未找到 best.pt/last.pt 在 {round_dir / "yolo_world"}'
+                )
+            print(f'[warn] round {k} 无 best.pt, 回退 last.pt')
+            _copy_path(last_pt, model_out)
+        else:
+            _copy_path(best_pt, model_out)
+        print(f'[round {k}] D: best.pt → {model_out.name}')
+
+    # ---- E 评估(固定 val 集, 透传 D 的 dataset yaml)
+    eval_path = round_dir / 'eval.json'
+    if eval_path.is_file():
+        print(f'[round {k}] E: eval.json 已存在, 跳过评估')
+        return json.loads(eval_path.read_text())
+    model = store['model'](str(model_out))
+    metrics = collect_eval_metrics(
+        model,
+        dataset_yaml=str(dataset_root / 'dataset' / 'dataset.yaml'),
+        imgsz=args.imgsz,
+        conf=args.conf_thresh,
+        iou=args.nms_iou,
+        names=list(store['names_list']),
+    )
+    eval_path.write_text(json.dumps(metrics, ensure_ascii=False, indent=2),
+                         encoding='utf-8')
+    return metrics
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
+    run_dir = Path(args.run_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    _store_config(args, run_dir)
+
+    # ---- 初始数据
+    d0 = load_coco(args.init_coco_json)
+    store = {
+        'image_dir': Path(args.image_dir),
+        'image_paths': sorted([
+            Path(args.image_dir) / fn for fn in (im['file_name'] for im in d0['images'])
+        ]),
+        'train_coco_path': str(run_dir / 'split_train.json'),
+        'val_coco_path': str(run_dir / 'split_val.json'),
+    }
+    names_list, _, cn_to_train = load_category_map(args.category_map)
+    store['names_list'] = names_list
+    store['cn_to_train'] = cn_to_train
+
+    store['train_coco'], store['val_coco'] = split_coco_by_image(
+        d0, val_ratio=args.val_ratio, seed=42
+    )
+    save_coco(store['train_coco'], store['train_coco_path'])
+    save_coco(store['val_coco'], store['val_coco_path'])
+    val_names = [im['file_name'] for im in store['val_coco']['images']]
+    split_path = run_dir / 'split.json'
+    if not split_path.is_file():
+        split_path.write_text(
+            json.dumps({'val_file_names': val_names}, ensure_ascii=False),
+            encoding='utf-8')
+
+    store['model'] = _resolve_model_provider_args(args)
+    rounds = _load_summary(run_dir)
+    last_done = rounds[-1]['round'] if rounds else -1
+    prev_pt: str | None = (
+        f'round_0/m0.pt' if last_done >= 0 and (run_dir / 'round_0' / 'm0.pt').is_file()
+        else None
+    )
+    early_stopped = False
+
+    for k in range(max(0, last_done + 1), args.max_rounds + 1):
+        print(f'======== Round {k}/{args.max_rounds}'
+              f'(k=0 用教师 d0; k>0 B→C→D→E) ========')
+        eval_d = run_round(args, run_dir, k, prev_pt, store)
+        vmap50 = eval_d['mAP50']
+        base_map50 = rounds[-1]['mAP50'] if rounds else vmap50
+        delta = 0.0 if k == 0 else round(vmap50 - base_map50, 5)
+        rounds.append({
+            'round': k,
+            'mAP50': vmap50,
+            'mAP': eval_d.get('mAP'),
+            'ap_per_class': eval_d.get('ap_per_class', {}),
+            'delta_map50': delta,
+        })
+        _store_summary(run_dir, rounds, f'round_{k}/m{k}.pt', False)
+        print(f'[Round {k}] mAP50={vmap50:.4f} (Δ={delta:+.4f})')
+
+        # 长尾呆类告警(不终止)
+        if len(rounds) >= args.ap_drop_window + 1:
+            _alert_per_class_drop(rounds, args.ap_drop_alert, args.ap_drop_window)
+
+        # 早停(round 0 不计入"连续 N 轮无提升"; 只数 round>0 末 N 轮)
+        if not early_stopped:
+            recent = [r for r in rounds if r['round'] > 0]
+            if len(recent) >= args.early_stop_no_improve:
+                tail_deltas = [r['delta_map50']
+                               for r in recent[-args.early_stop_no_improve:]]
+                if all(d <= 0 for d in tail_deltas):
+                    print(f'[Early-stop] 末 {args.early_stop_no_improve} 轮 mAP50 无提升, 提前结束')
+                    early_stopped = True
+                    break
+
+        prev_pt = f'round_{k}/m{k}.pt'
+
+    _store_summary(run_dir, rounds, prev_pt, early_stopped)
+    print(f'完成: {run_dir / "summary.json"}')
+
+
+if __name__ == '__main__':
+    main()

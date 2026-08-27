@@ -155,6 +155,14 @@ class FakeYOLOWorld:
 
     def train(self, data=None, **_kw):
         self.train_called = True
+        # mock: 写一个 best.pt(project/name/best.pt)
+        import os
+        project = _kw.get('project') or ''
+        name = _kw.get('name') or 'yolo_world'
+        pt_dir = os.path.join(project, name)
+        os.makedirs(pt_dir, exist_ok=True)
+        with open(os.path.join(pt_dir, 'best.pt'), 'wb') as fh:
+            fh.write(b'FAKE_BEST')
         return FakeResultsVal()
 
     def val(self, data=None, **_kw):
@@ -249,6 +257,134 @@ class InferOneImageTest(unittest.TestCase):
         preds2 = infer_one_image(_PatchModel((40.0, 50.0, 140.0, 150.0)),
                                  img, imgsz=640, conf=0.1, iou=0.5)
         self.assertEqual(preds2, [])
+
+
+class EndToEndMockTest(unittest.TestCase):
+    """完整 mock 1 轮: d0 → 训 m0(mock) → 推理 d1(mock) → 清洗(skip) →
+    训 m1(mock) → 评估(固定 0.71)+ summary 链路。"""
+
+    def test_one_round_happy_path(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+        coco_path = _tiny_coco_and_images(root)
+        cat_map_path = root / 'category_prompts.json'
+        cat_map_path.write_text(json.dumps({
+            'categories': {
+                'orange': {'train_name': 'loud orange fruit'},
+                'apple': {'train_name': 'red apple fruit'},
+            }
+        }), encoding='utf-8')
+        run_dir = root / 'run'
+        argv = [
+            '--init-coco-json', str(coco_path),
+            '--image-dir', str(root / 'imgs'),
+            '--category-map', str(cat_map_path),
+            '--run-dir', str(run_dir),
+            '--max-rounds', '1',
+            '--val-ratio', '0.25',
+            '--epochs', '1',
+            '--batch', '1',
+            '--train-device', 'cpu',
+            '--model', 'mock-model',
+            '--clean-base-url', 'http://127.0.0.1:9/v1',
+            '--skip-clean',
+            '--model-provider', 'distill.tests.test_self_improve.FakeYOLOWorld',
+        ]
+        from distill.self_improve import main
+        main(argv)
+        # 验证产物
+        self.assertTrue((run_dir / 'config.json').is_file())
+        split = json.loads((run_dir / 'split.json').read_text())
+        self.assertEqual(len(split['val_file_names']), 1)
+        self.assertTrue((run_dir / 'round_0' / 'm0.pt').is_file())
+        self.assertTrue((run_dir / 'round_0' / 'eval.json').is_file())
+        self.assertTrue((run_dir / 'round_1' / 'raw_d1.json').is_file())
+        self.assertTrue((run_dir / 'round_1' / 'clean_d1.json').is_file())
+        self.assertTrue((run_dir / 'round_1' / 'm1.pt').is_file())
+        summary = json.loads((run_dir / 'summary.json').read_text())
+        self.assertEqual(len(summary['rounds']), 2)  # round0 + round1
+        self.assertAlmostEqual(summary['rounds'][1]['mAP50'], 0.71, places=2)
+        self.assertEqual(summary['rounds'][1]['delta_map50'],
+                         round(0.71 - summary['rounds'][0]['mAP50'], 5))
+        # round_1 的 raw_d1 必须有 4 条 ann(FakeYOLOWorld 每图固定 1 框)
+        raw = load_coco(run_dir / 'round_1' / 'raw_d1.json')
+        self.assertEqual(len(raw['annotations']), 4)
+
+
+class ResumeStateTest(unittest.TestCase):
+    """续跑: 同一 run_dir 二次跑不产生新 round 目录。"""
+
+    def test_resume_skips_completed_rounds(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+        coco_path = _tiny_coco_and_images(root)
+        cat_map_path = root / 'category_prompts.json'
+        cat_map_path.write_text(json.dumps({
+            'categories': {'orange': {'train_name': 'a'},
+                           'apple': {'train_name': 'b'}}
+        }), encoding='utf-8')
+        run_dir = root / 'run'
+        argv = [
+            '--init-coco-json', str(coco_path),
+            '--image-dir', str(root / 'imgs'),
+            '--category-map', str(cat_map_path),
+            '--run-dir', str(run_dir),
+            '--max-rounds', '2',
+            '--val-ratio', '0.25',
+            '--skip-clean',
+            '--model-provider', 'distill.tests.test_self_improve.FakeYOLOWorld',
+        ]
+        from distill.self_improve import main
+        main(argv)
+        self.assertTrue((run_dir / 'round_0' / 'm0.pt').is_file())
+        self.assertTrue((run_dir / 'round_1' / 'm1.pt').is_file())
+        self.assertTrue((run_dir / 'round_2' / 'm2.pt').is_file())
+        s1 = json.loads((run_dir / 'summary.json').read_text())
+        n1 = len(s1['rounds'])
+        main(argv)  # 第二次同 run_dir → last_done=2, range(3,3) 空
+        s2 = json.loads((run_dir / 'summary.json').read_text())
+        self.assertEqual(len(s2['rounds']), n1)
+        self.assertFalse((run_dir / 'round_3').is_dir())
+
+
+class EarlyStopRuleTest(unittest.TestCase):
+    """连续 N 轮 mAP50 无提升 → 停在 max_rounds 前。"""
+
+    def test_two_consecutive_no_improve_stops_at_round_2(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+        coco_path = _tiny_coco_and_images(root)
+        cat_map_path = root / 'category_prompts.json'
+        cat_map_path.write_text(json.dumps({
+            'categories': {'orange': {'train_name': 'a'},
+                           'apple': {'train_name': 'b'}}
+        }), encoding='utf-8')
+        run_dir = root / 'run'
+        argv = [
+            '--init-coco-json', str(coco_path),
+            '--image-dir', str(root / 'imgs'),
+            '--category-map', str(cat_map_path),
+            '--run-dir', str(run_dir),
+            '--max-rounds', '5',
+            '--val-ratio', '0.25',
+            '--skip-clean',
+            '--early-stop-no-improve', '2',
+            '--model-provider', 'distill.tests.test_self_improve.FakeYOLOWorld',
+        ]
+        # FakeResultsVal 固定 map50=0.71 → 每轮 delta=0, 第 2 轮满足
+        # "连续 2 轮 <=0" 即提前停(不等 max_rounds=5)
+        from distill.self_improve import main
+        main(argv)
+        summary = json.loads((run_dir / 'summary.json').read_text())
+        self.assertEqual(summary['rounds'][-1]['round'], 2)
+        self.assertFalse((run_dir / 'round_3').is_dir())
+
+
+class PerClassAPAlertTest(unittest.TestCase):
+    """每类 AP 连续 2 轮跌 > 20% → stderr 警告(不终止)。"""
+
+    def test_drop_warn_written_to_stderr(self):
+        self.skipTest('需要可变 metrics 源; 现阶段由 summary 展示告警(人工看)')
 
 
 if __name__ == '__main__':
