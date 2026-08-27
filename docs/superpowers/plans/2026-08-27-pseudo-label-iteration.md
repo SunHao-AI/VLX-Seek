@@ -85,20 +85,23 @@ class CropDecodeTest(unittest.TestCase):
         self.assertEqual(box, (0, 0, 100, 100))
 
     def test_mid_target_mid_image_no_downscale(self):
+        # [100,200,400,300] 中心 (300, 350), 窗口 640x640 → left=max(0, -20)=0,
+        # top=max(0, 30)=30, 窗口 [0, 30, 640, 670]; 不缩; 局部 (100, 170, 400, 300)
         data, box = crop_decode(self.img_mid, [100, 200, 400, 300],
                                 min_crop_size=640, max_side=960)
         im = self._decode(data)
         self.assertEqual(im.size, (640, 640))
-        self.assertEqual(box, (120, 170, 400, 300))
+        self.assertEqual(box, (100, 170, 400, 300))
 
     def test_large_target_triggers_downscale(self):
-        # [1000, 800, 2000, 1500] 在 4000x3000 上: crop = 2000x1500, max_side=960
-        # scale = 960/2000 = 0.48 → 局部 (480, 384, 960, 720)
+        # [1000,800,2000,1500] 中心 (2000,1550), 窗口 2000x1500 → 窗口 [1000,800,3000,2300]
+        # size=(2000,1500), max_side=960 → scale=960/2000=0.48 → resize=(960,720)
+        # 局部 box = (0, 0, 960, 720)
         data, box = crop_decode(self.img_big, [1000, 800, 2000, 1500],
                                 min_crop_size=640, max_side=960)
         im = self._decode(data)
-        self.assertEqual(max(im.size), 960)
-        self.assertEqual(box, (480, 384, 960, 720))
+        self.assertEqual((im.size), (960, 720))
+        self.assertEqual(box, (0, 0, 960, 720))
 
     def test_image_smaller_than_min_raises(self):
         tiny = Image.new('RGB', (500, 500), (1, 2, 3))
