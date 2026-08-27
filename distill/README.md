@@ -207,8 +207,10 @@ uv run python distill/clean_pseudo_labels.py \
 | `--concurrency` | `16` | 并发请求线程数（按服务吞吐调整） |
 | `--iou-threshold` | `0.55` | 同图同类别 NMS 的 IoU 阈值 |
 | `--no-dedup` | 关 | 跳过本地去重阶段，仅做 VLM 验证 |
-| `--max-side` | `512` | 裁剪图最长边超过则等比缩小后再上传 |
-| `--min-crop-pad` | `0.12` | 裁剪框四周外扩比例（保留上下文） |
+| `--max-side` | `960` | 裁剪图最长边超过则等比缩小（只缩不放） |
+| `--min-crop-size` | `640` | 裁剪最小边（像素），目标居中，越界反推（借 `cv_utils.tools.crop_image.crop_rect`）；原图任一边 < 该值时报错 |
+| `--box-color` | `red` | 裁剪图上目标框颜色（`red` / `yellow` / `off`） |
+| `--no-draw-box` | 关 | 等同 `--box-color off`，回退旧 prompt |
 | `--decision-log` | `<输出名>.decisions.jsonl` | 决策日志 JSONL 路径（断点续跑必需） |
 | `--max-retries` | `3` | 单框请求最大重试次数 |
 | `--timeout` | `120` | 单次请求超时秒数 |
@@ -216,8 +218,8 @@ uv run python distill/clean_pseudo_labels.py \
 
 行为要点：
 
-1. **三阶段流水线**：阶段1 本地按 (图, 类别) 分组做 IoU-NMS 去重（面积大的框优先保留）；阶段2 逐框裁剪（外扩 12%、最小边 32px、JPEG 质量 85）并把裁剪图内的目标框坐标一并写入提示词发送 VLM 判定；阶段3 写出——标注 id 重排连续、info/categories 原样透传、清零图像保留作负样本。
-   - 询问提示词形如「这张从大图裁出的局部区域中，矩形框(x, y, w, h)内的主要拍摄对象是否属于类别「{name}」？」；其中 `{name}` 直接取 COCO `categories.name`（该字段值即 `category_prompts.json` 各类别的 `prompt` 语义描述）。
+1. **三阶段流水线**：阶段1 本地按 (图, 类别) 分组做 IoU-NMS 去重（面积大的框优先保留）；阶段2 逐框裁剪（目标居中、最小边 `--min-crop-size`、长边 > `--max-side` 等比缩小、只缩不放）；并在裁剪图上画出目标框（默认红、4px 线宽），把裁剪图发送给 VLM 判定；阶段3 写出——标注 id 重排连续、info/categories 原样透传、清零图像保留作负样本。
+   - 提示词不再注入 `(x, y, w, h)` 像素坐标，而是写 `"红色矩形框已标注了待审核目标，请看图判断框内主体是否属于「{name}」"`，视觉注意力直接聚焦红框内区域；其中 `{name}` 直接取 COCO `categories.name`（该字段值即 `category_prompts.json` 各类别的 `prompt` 语义描述）。
 2. **断点续跑**：每个框的判定实时追加写入决策日志；中断后原命令重跑即自动跳过已完成框（进度条 total 会扣除已判定数量）。若更改了模型/IoU 阈值等关键参数，需先删除旧日志再重跑（脚本检测到参数不一致会告警并不沿用）。
 3. **fail-open 原则**：VLM 无法判断/回复乱码/重试耗尽时保守保留该框，只有明确的"否"才删除；仅当首个请求出现连接拒绝或域名解析失败时快速退出，提示检查服务地址。
 4. **两级进度条**：外层按图像推进显示整体 ETA，内层按真实 VLM 调用框数推进显示剩余时间。
@@ -348,6 +350,69 @@ python distill/finetune_yolo_world.py \
 - **`--batch` 是全局批大小**：DDP 下会被均分到各卡（每卡 = batch ÷ 卡数）。如 4 卡 + `--batch 32` → 每卡实际处理 8 张；想保持和单卡一样的有效批量就维持原值，想提升吞吐则按卡数等比放大。
 - **不能用 AutoBatch**：多卡模式下 `--batch -1` 会直接报错，必须显式指定。
 - `rect=True` 与多卡不兼容，若启用会自动被置为 False（默认关闭，无影响）。
+
+## 步骤6（可选）：自改进迭代 —— 让模型越训越好
+
+当希望 student 不再完全依赖教师伪标签时进入自改进循环：round 0 用教师 d0 训 m0；后续每轮 m_{k-1} 整图推理 → Qwen 清洗 → 热启动微调 m_k。不调 VLX-Seek 教师，验证集固定（按 image 切 `--val-ratio`，永不参与训练），早停基于 mAP50 连续 N 轮无提升。
+
+```bash
+uv run python distill/self_improve.py \
+    --init-coco-json distill/data/pseudo_labels.json \
+    --image-dir distill/data/images \
+    --category-map distill/data/category_prompts.json \
+    --max-rounds 3 --val-ratio 0.1 --epochs 30 --batch 32 \
+    --imgsz 640 --train-device 0 --infer-device 0 \
+    --clean-base-url http://127.0.0.1:8101/v1 \
+    --model qwen3.8-vllm --api-key "$OPENAI_API_KEY" \
+    --run-dir self_improve_runs/run_$(date +%Y%m%d_%H%M)
+```
+
+参数精简（全量看 `--help`）：
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `--init-coco-json` | 必填 | 教师伪标签 d0 |
+| `--init-weights` | `yolov8s-worldv2.pt` | m0 热启动起点 |
+| `--max-rounds` | `3` | self-improve 轮数（不含 round 0） |
+| `--val-ratio` | `0.1` | image-level 验证集比例（固定切，不参与训练） |
+| `--imgsz` | `640` | 推理 / 训练 / 评估一致分辨率 |
+| `--conf-thresh / --nms-iou` | `0.30 / 0.50` | 推理阈值 |
+| `--epochs / --batch / --optimizer / --lr0 / --patience` | 同微调 | 单轮训练超参 |
+| `--train-device / --infer-device` | `0 / 0` | GPU（train 可按需 DDP "0,1"） |
+| `--clean-* / --model / --api-key` | 同步骤 4.5 | 透传清洗参数 |
+| `--early-stop-no-improve` | `2` | 连续 N 轮 mAP50 无提升 → 提前停 |
+| `--ap-drop-alert / --ap-drop-window` | `0.20 / 2` | 每类 AP 跌幅阈值（仅告警） |
+| `--run-dir` | 必填 | 输出根目录 |
+| `--skip-clean` | 关 | 调试用，跳过清洗（生产禁用） |
+
+产出目录：
+
+```
+<run_dir>/
+├── config.json             # 全部参数
+├── split.json              # val 的 file_name 列表（固定）
+├── split_train.json / split_val.json
+├── summary.json            # 所有轮 mAP50 折线 + final_model + early_stopped
+├── round_0/
+│   ├── dataset/            # ultralytics 训练数据（dataset.yaml / images / labels）
+│   ├── yolo_world/best.pt  # ultralytics 原始产物
+│   ├── m0.pt               # 归档
+│   └── eval.json
+├── round_1/                # B/C/D/E
+│   ├── raw_d1.json
+│   ├── clean_d1.json
+│   ├── decisions_d1.jsonl
+│   ├── dataset/
+│   ├── m1.pt
+│   └── eval.json
+└── round_2/ ...
+```
+
+**断点续跑**：重跑同一 `--run-dir`，已完成步骤自动跳过（以 `raw_d{k}.json` / `clean_d{k}.json` / `m{k}.pt` / `eval.json` / `config.json` / `split.json` 为 marker）。
+
+**早停 / 告警**：末 `--early-stop-no-improve` 轮 mAP50 delta 全 <=0 即停（round 0 不计入 tail）；每类 AP 连续 `--ap-drop-window` 轮跌幅 > `--ap-drop-alert` 只 stderr 告警不终止（人工观察长尾类退化）。
+
+**注意**：VLM 清洗是单调"减法"——删除的不可逆，数据量逐轮递减；观察 summary.json 若 mAP50 反复下滑，可考虑提前停止或重做 d0。
 
 ## 端到端示例（examples/）
 
